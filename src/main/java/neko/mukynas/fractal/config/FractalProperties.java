@@ -51,8 +51,26 @@ public class FractalProperties {
         private Duration lockRefreshInterval = Duration.ofMinutes(1);
         private Duration quiescencePeriod = Duration.ZERO;
         private Duration drainTimeout = Duration.ofSeconds(10);
+        private Duration statusCacheTtl = Duration.ofSeconds(2);
+        private long statusCacheMaxSize = 50_000L;
         private int batchSize = 500;
         private int maxBatchParameters = 32766;
+
+        public Duration getStatusCacheTtl() {
+            return statusCacheTtl;
+        }
+
+        public void setStatusCacheTtl(Duration statusCacheTtl) {
+            this.statusCacheTtl = statusCacheTtl;
+        }
+
+        public long getStatusCacheMaxSize() {
+            return statusCacheMaxSize;
+        }
+
+        public void setStatusCacheMaxSize(long statusCacheMaxSize) {
+            this.statusCacheMaxSize = statusCacheMaxSize;
+        }
 
         public List<String> getReplicaTables() {
             return replicaTables;

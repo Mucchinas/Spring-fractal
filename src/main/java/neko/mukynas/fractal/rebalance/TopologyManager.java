@@ -1,5 +1,7 @@
 package neko.mukynas.fractal.rebalance;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -28,6 +30,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     private final boolean autoInitializeSchema;
     private final Set<String> activeMigratingTenants = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, java.util.concurrent.atomic.LongAdder> inFlightRequests = new ConcurrentHashMap<>();
+    private final Cache<String, Boolean> migrationStatusCache;
 
     private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "fractal-lock-heartbeat");
@@ -39,13 +42,23 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     private volatile boolean lockHeld = false;
 
     public TopologyManager(DataSource primaryDataSource) {
-        this(primaryDataSource, true);
+        this(primaryDataSource, true, Duration.ofSeconds(2), 50_000L);
     }
 
     public TopologyManager(DataSource primaryDataSource, boolean autoInitializeSchema) {
+        this(primaryDataSource, autoInitializeSchema, Duration.ofSeconds(2), 50_000L);
+    }
+
+    public TopologyManager(DataSource primaryDataSource, boolean autoInitializeSchema, Duration statusCacheTtl, long statusCacheMaxSize) {
         this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
         this.instanceId = generateInstanceId();
         this.autoInitializeSchema = autoInitializeSchema;
+        Duration ttl = statusCacheTtl != null ? statusCacheTtl : Duration.ofSeconds(2);
+        long maxSize = statusCacheMaxSize > 0 ? statusCacheMaxSize : 50_000L;
+        this.migrationStatusCache = Caffeine.newBuilder()
+                .maximumSize(maxSize)
+                .expireAfterWrite(ttl)
+                .build();
     }
 
     @Override
@@ -63,15 +76,21 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         return lockHeld;
     }
 
+    public Cache<String, Boolean> getMigrationStatusCache() {
+        return migrationStatusCache;
+    }
+
     public void markTenantMigrating(String tenantId) {
         if (tenantId != null) {
             activeMigratingTenants.add(tenantId);
+            migrationStatusCache.put(tenantId, true);
         }
     }
 
     public void markTenantActive(String tenantId) {
         if (tenantId != null) {
             activeMigratingTenants.remove(tenantId);
+            migrationStatusCache.put(tenantId, false);
         }
     }
 
@@ -125,6 +144,10 @@ public class TopologyManager implements InitializingBean, DisposableBean {
             return true;
         }
 
+        return Boolean.TRUE.equals(migrationStatusCache.get(tenantId, key -> checkMigrationInPrimaryDb(key, props)));
+    }
+
+    private boolean checkMigrationInPrimaryDb(String tenantId, neko.mukynas.fractal.config.FractalProperties.RebalancerProperties props) {
         // Check if there is an in-flight migration record in fractal_tenant_migrations
         try {
             List<String> phases = primaryJdbcTemplate.query(
@@ -298,6 +321,9 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     // In-flight Migration Tracking for Idempotent Crash Recovery
 
     public void recordMigrationStart(String tenantId, String sourceShard, String targetShard) {
+        if (tenantId != null) {
+            migrationStatusCache.put(tenantId, true);
+        }
         try {
             primaryJdbcTemplate.update("DELETE FROM fractal_tenant_migrations WHERE tenant_id = ?", tenantId);
             primaryJdbcTemplate.update("""
@@ -320,6 +346,9 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     }
 
     public void clearMigrationRecord(String tenantId) {
+        if (tenantId != null) {
+            migrationStatusCache.invalidate(tenantId);
+        }
         try {
             primaryJdbcTemplate.update(
                     "DELETE FROM fractal_tenant_migrations WHERE tenant_id = ?",

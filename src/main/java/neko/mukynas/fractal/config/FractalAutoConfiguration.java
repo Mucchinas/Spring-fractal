@@ -85,7 +85,9 @@ public class FractalAutoConfiguration {
         // Costruiamo il datasource primario appositamente per le logiche di admin
         DataSource primary = buildDataSource(properties.getPrimary());
         boolean autoInitSchema = properties.getPrimary() == null || properties.getPrimary().isInitializeSchema();
-        return new TopologyManager(primary, autoInitSchema);
+        java.time.Duration cacheTtl = properties.getRebalancer() != null ? properties.getRebalancer().getStatusCacheTtl() : java.time.Duration.ofSeconds(2);
+        long cacheMaxSize = properties.getRebalancer() != null ? properties.getRebalancer().getStatusCacheMaxSize() : 50_000L;
+        return new TopologyManager(primary, autoInitSchema, cacheTtl, cacheMaxSize);
     }
 
     /**

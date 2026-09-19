@@ -14,6 +14,7 @@ Fractal is an automated horizontal database sharding starter for Spring Boot 3 a
   - [Key Extraction Pipeline](#key-extraction-pipeline)
 - [Automated Rebalancer and Migration Subsystem](#automated-rebalancer-and-migration-subsystem)
   - [Topology Management, Distributed Locking, and Heartbeat](#topology-management-distributed-locking-and-heartbeat)
+  - [High-Performance In-Memory Migration Cache (Caffeine) & Root Catalog Architecture](#high-performance-in-memory-migration-cache-caffeine--root-catalog-architecture)
   - [Delta Calculation](#delta-calculation)
   - [Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, & @ShardedStatus)](#domain-entity-auto-discovery-shardedentity-shardedkey--shardedstatus)
   - [Database Catalog Dependency Resolution](#database-catalog-dependency-resolution)
@@ -60,8 +61,10 @@ Fractal intercepts business method execution at the service layer to resolve a s
 |     - Priority A: ShardingKeyExtractor chain (e.g. JWT claim)          |
 |     - Priority B: SpEL expression evaluation on method arguments       |
 |                                                                       |
-|  2. Tenant Migration Guard:                                           |
+|  2. Tenant Migration Guard (Zero-Overhead Caffeine In-Memory Cache):   |
 |     - Check TopologyManager.isTenantMigrating(key)                    |
+|     - Fast path: Caffeine in-memory cache lookup (~15 nanoseconds)    |
+|     - Slow path: Authoritative query to Primary DB on cache miss/TTL   |
 |     - Throws TenantMigratingException if migration is in flight       |
 |                                                                       |
 |  3. ConsistentHashRouter:                                             |
@@ -225,6 +228,29 @@ Fractal includes a background data rebalancing mechanism designed to handle clus
   1. The heartbeat daemon thread is cancelled and stopped cleanly.
   2. The `REBALANCE_LOCK` row is released immediately in `fractal_locks`.
   3. Spring's `fractalRebalanceExecutor` is configured with `setWaitForTasksToCompleteOnShutdown(true)` and `setAwaitTerminationSeconds(30)` to permit currently in-flight batch copies to finish before complete termination.
+
+### High-Performance In-Memory Migration Cache (Caffeine) & Root Catalog Architecture
+
+To guarantee maximum throughput while preserving strict consistency during rebalancing, Fractal couples a **Primary Database Tenant Catalog** with an in-process **Caffeine In-Memory Cache**:
+
+#### 1. Dual-Presence Root Table Architecture (Primary Catalog + Local Shard Slices)
+- **Primary Database (Central Tenant Catalog & Orchestrator)**:
+  The master root table (e.g. `organizations`) resides on the Primary Database. It acts as the single source of truth for global tenant identity, cross-shard uniqueness enforcement, and cluster-wide migration lifecycle tracking (`ACTIVE` vs. `MIGRATING`). During a rebalance, `RebalanceEngine.setTenantStatus()` and `TopologyManager.isTenantMigrating()` operate directly against this master table on the Primary DB.
+- **Physical Shards (Local Slices for Relational Joins & Foreign Keys)**:
+  Each physical shard also provisions the root table schema, populated strictly with the subset of tenants resident on that shard. This ensures that intra-shard relational joins (e.g., `SELECT * FROM projects p JOIN organizations o ON p.org_id = o.org_id`) and database-level foreign key constraints (`ON DELETE CASCADE`) execute natively with zero cross-database query penalties.
+- During rebalancing, `RebalanceEngine` streams the tenant root row along with all child rows from the source shard to the target shard and prunes it from the source shard, while the master record on the Primary Database remains permanently intact.
+
+#### 2. Sub-Microsecond Cache-Aside Migration Guard
+Synchronous database round-trips on every service method invocation would bottleneck the Primary DB and introduce unacceptable latency. `TopologyManager` wraps the status check in an optimized [Caffeine](https://github.com/ben-manes/caffeine) cache:
+- **Fast-Path Lookup**: Every `@Sharded` method checks the local Caffeine cache in **~15 nanoseconds** directly from JVM heap memory without touching the network or database connection pool.
+- **Slow-Path Refresh**: On a cache miss or TTL expiration, `TopologyManager` queries `fractal_tenant_migrations` and the master root table on the Primary DB, populating the cache.
+- **Proactive Local Cache Priming**:
+  - `markTenantMigrating(id)`: Immediately primes the local cache with `true` to block local requests without waiting for a database round-trip.
+  - `markTenantActive(id)`: Immediately updates the cache with `false`.
+  - `recordMigrationStart(id, ...)`: Updates the cache with `true`.
+  - `clearMigrationRecord(id)`: Invalidates the cache entry, forcing a clean reload on the next access.
+- **Drain Timeout Safety Invariant**:
+  By default, `status-cache-ttl` is set to `2s`, while `drain-timeout` defaults to `10s` (minimum `5s`). Because $drainTimeout \ge statusCacheTtl + \text{network RTT}$, any stale cached `ACTIVE` entry across other cluster nodes is mathematically guaranteed to expire and reload `MIGRATING` from the Primary DB long before the rebalancer initiates physical row deletion on the source shard.
 
 ### Delta Calculation
 
@@ -569,6 +595,8 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.rebalancer.lock-refresh-interval` | `Duration` | `1m` | Periodic heartbeat interval for renewing `locked_at` during an active rebalance migration. |
 | `fractal.sharding.rebalancer.drain-timeout` | `Duration` | `10s` | Maximum duration to wait for pre-existing local in-flight transactions for a tenant to drain to 0 before deferring migration. |
 | `fractal.sharding.rebalancer.quiescence-period` | `Duration` | `0s` | Optional cluster-wide pause after setting `MIGRATING` status before copying data, giving remote nodes time to commit in-flight transactions. |
+| `fractal.sharding.rebalancer.status-cache-ttl` | `Duration` | `2s` | Time-to-live for cached tenant migration status in local Caffeine in-memory cache to eliminate per-request DB queries. |
+| `fractal.sharding.rebalancer.status-cache-max-size` | `long` | `50000` | Maximum number of tenant status entries cached in local memory (< 2MB RAM). |
 | `fractal.sharding.rebalancer.batch-size` | `int` | `500` | Target chunk size for batch inserts during data copying and replica synchronization. |
 | `fractal.sharding.rebalancer.max-batch-parameters` | `int` | `32766` | Maximum total JDBC bind parameters per chunk ($batchSize \times columns \le maxParameters$) to prevent parameter overflow errors (e.g. Postgres 65,535). |
 | `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
@@ -614,6 +642,8 @@ fractal:
       lock-refresh-interval: 1m   # periodic heartbeat to renew lock (default: 1m)
       drain-timeout: 10s          # wait time for in-flight requests to complete before migration (default: 10s)
       quiescence-period: 0s       # cluster-wide pause for distributed transactions (default: 0s)
+      status-cache-ttl: 2s        # Caffeine in-memory cache TTL for migration checks (default: 2s)
+      status-cache-max-size: 50000 # Max tenants cached in local JVM heap (default: 50000)
       batch-size: 500             # target batch size for row copying (default: 500)
       max-batch-parameters: 32766 # max total JDBC bind parameters per chunk (default: 32766)
       # Zero-Config: When using @ShardedEntity(root = true), @ShardedKey, and @ShardedStatus,
@@ -979,13 +1009,14 @@ Execute the unit and integration test suite:
 mvn clean test
 ```
 
-The test suite covers 57 automated tests across 15 test suites:
+The test suite covers 59 automated tests across 16 test suites:
 - `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes on the 64-bit ring.
 - `RoutingIntegrationTest`: Verifies dynamic shard selection, primary fallback, and SpEL resolution using in-memory H2 databases.
 - `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens (`sub` claim) in `SecurityContextHolder`.
 - `CustomClaimSecurityRoutingIntegrationTest`: Tests end-to-end shard routing using custom JWT claims (e.g. `tenant_id`).
 - `JwtSecurityKeyExtractorTest`: Validates custom claim extraction, fallback logic, string/numeric/UUID claim conversions, and unauthenticated state handling.
 - `ShardingAspectMigrationLockTest`: Asserts that `TenantMigratingException` is thrown when accessing a tenant currently flagged as migrating.
+- `TopologyManagerCaffeineCacheTest`: Validates sub-microsecond in-memory Caffeine caching for tenant migration checks, zero database queries within TTL, proactive local cache invalidation on status updates, and automatic background refresh on TTL expiration.
 - `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution (`users` -> `projects` -> `tasks`), Kahn's topological sort for insert/delete ordering, join query synthesis, table exclusion, and replica table isolation.
 - `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity`, `@ShardedKey`, `@ShardedStatus`, and `@ShardedReplica`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
 - `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans and `@ShardedStatus`, while ensuring replicated tables (`currencies`) are preserved on all shards.
