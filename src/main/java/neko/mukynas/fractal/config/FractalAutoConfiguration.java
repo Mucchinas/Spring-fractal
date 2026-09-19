@@ -77,10 +77,12 @@ public class FractalAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean
     public TopologyManager topologyManager(FractalProperties properties) {
         // Costruiamo il datasource primario appositamente per le logiche di admin
         DataSource primary = buildDataSource(properties.getPrimary());
-        return new TopologyManager(primary);
+        boolean autoInitSchema = properties.getPrimary() == null || properties.getPrimary().isInitializeSchema();
+        return new TopologyManager(primary, autoInitSchema);
     }
 
     /**
@@ -96,6 +98,8 @@ public class FractalAutoConfiguration {
         executor.setThreadNamePrefix("fractal-rebalancer-");
         // Abbassiamo la priorità del thread a livello sistema operativo/JVM
         executor.setThreadPriority(Thread.MIN_PRIORITY);
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(30);
         executor.initialize();
         return executor;
     }
@@ -166,27 +170,49 @@ public class FractalAutoConfiguration {
                 Set<String> yamlShards = properties.getShards().keySet();
                 List<String> dbShards = topologyManager.getKnownShardsFromDb();
 
-                // 3. Controlla se ci sono shard nuovi nello YAML non presenti nel DB
+                // 3. Controlla se ci sono shard nuovi nello YAML o migrazioni interrotte da completare
                 boolean hasNewShards = yamlShards.stream().anyMatch(s -> !dbShards.contains(s));
+                List<TopologyManager.PendingMigration> pendingMigrations = topologyManager.getPendingMigrations();
+                boolean hasPending = !pendingMigrations.isEmpty();
 
-                if (hasNewShards) {
-                    System.out.println("FRACTAL: Rilevata discrepanza topologia. Nuovi shard aggiunti nello YAML!");
+                if (hasNewShards || hasPending) {
+                    if (hasPending) {
+                        System.out.println("FRACTAL: Rilevate " + pendingMigrations.size() + " migrazioni interrotte da completare in modo idempotente.");
+                    }
+                    if (hasNewShards) {
+                        System.out.println("FRACTAL: Rilevata discrepanza topologia. Nuovi shard aggiunti nello YAML!");
+                    }
+
                     fractalRebalanceExecutor.execute(() -> {
-                        if (topologyManager.tryAcquireRebalanceLock()) {
+                        if (topologyManager.tryAcquireRebalanceLock(
+                                properties.getRebalancer().getLockTimeout(),
+                                properties.getRebalancer().getLockRefreshInterval())) {
                             try {
                                 if (properties.getRebalancer().getRootTable() == null || properties.getRebalancer().getRootIdColumn() == null) {
                                     System.out.println("FRACTAL: Rebalancer abilitato ma root-table o root-id-column non configurati. Registrazione shard.");
                                     yamlShards.forEach(topologyManager::registerNewShard);
                                     return;
                                 }
-                                MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(
-                                        buildDataSource(properties.getPrimary()),
-                                        properties.getRebalancer()
-                                );
-                                List<MigrationDeltaCalculator.MigrationAction> actions =
-                                        calculator.calculateDelta(dbShards, yamlShards, properties.getVirtualNodes());
-                                rebalanceEngine.executeMigration(actions);
-                                yamlShards.forEach(topologyManager::registerNewShard);
+
+                                // 1. Risoluzione idempotente di migrazioni interrotte da un precedente crash
+                                if (!pendingMigrations.isEmpty()) {
+                                    List<MigrationDeltaCalculator.MigrationAction> recoveryActions = pendingMigrations.stream()
+                                            .map(p -> new MigrationDeltaCalculator.MigrationAction(p.tenantId(), p.sourceShard(), p.targetShard()))
+                                            .toList();
+                                    rebalanceEngine.executeMigration(recoveryActions);
+                                }
+
+                                // 2. Esecuzione del delta per i nuovi shard
+                                if (hasNewShards) {
+                                    MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(
+                                            buildDataSource(properties.getPrimary()),
+                                            properties.getRebalancer()
+                                    );
+                                    List<MigrationDeltaCalculator.MigrationAction> actions =
+                                            calculator.calculateDelta(dbShards, yamlShards, properties.getVirtualNodes());
+                                    rebalanceEngine.executeMigration(actions);
+                                    yamlShards.forEach(topologyManager::registerNewShard);
+                                }
                             } catch (Exception e) {
                                 System.err.println("FRACTAL: Errore durante l'esecuzione del rebalancing automatico: " + e.getMessage());
                             } finally {

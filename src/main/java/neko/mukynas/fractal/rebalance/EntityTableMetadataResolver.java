@@ -392,7 +392,9 @@ public class EntityTableMetadataResolver {
             for (BeanDefinition bd : scanner.findCandidateComponents(basePackage)) {
                 try {
                     Class<?> clazz = ClassUtils.forName(bd.getBeanClassName(), applicationContext.getClassLoader());
-                    classes.add(clazz);
+                    if (!clazz.isMemberClass() && !clazz.isAnonymousClass()) {
+                        classes.add(clazz);
+                    }
                 } catch (ClassNotFoundException ignored) {
                 }
             }

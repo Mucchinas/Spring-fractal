@@ -2,6 +2,7 @@ package neko.mukynas.fractal.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -43,6 +44,24 @@ public class FractalProperties {
 
         private List<String> shardedTables;
         private List<String> excludeTables;
+        private Duration lockTimeout = Duration.ofMinutes(15);
+        private Duration lockRefreshInterval = Duration.ofMinutes(1);
+
+        public Duration getLockTimeout() {
+            return lockTimeout;
+        }
+
+        public void setLockTimeout(Duration lockTimeout) {
+            this.lockTimeout = lockTimeout;
+        }
+
+        public Duration getLockRefreshInterval() {
+            return lockRefreshInterval;
+        }
+
+        public void setLockRefreshInterval(Duration lockRefreshInterval) {
+            this.lockRefreshInterval = lockRefreshInterval;
+        }
 
         public List<String> getExcludeTables() {
             return excludeTables;
@@ -146,6 +165,7 @@ public class FractalProperties {
         private String jdbcUrl;
         private String username;
         private String password;
+        private boolean initializeSchema = true;
 
         public String getJdbcUrl() {
             return jdbcUrl;
@@ -169,6 +189,14 @@ public class FractalProperties {
 
         public void setPassword(String password) {
             this.password = password;
+        }
+
+        public boolean isInitializeSchema() {
+            return initializeSchema;
+        }
+
+        public void setInitializeSchema(boolean initializeSchema) {
+            this.initializeSchema = initializeSchema;
         }
     }
 }

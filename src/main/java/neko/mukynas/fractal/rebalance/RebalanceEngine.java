@@ -75,14 +75,54 @@ public class RebalanceEngine {
                 NamedParameterJdbcTemplate source = shardTemplates.get(action.sourceShard());
                 NamedParameterJdbcTemplate target = shardTemplates.get(action.targetShard());
 
-                // 3. Copia dei dati (Rispetta i vincoli di Foreign Key tramite hopping)
-                for (TableMigrationPlan plan : insertPlans) {
-                    copyTableData(userId, plan, source, target);
+                if (source == null || target == null) {
+                    System.err.println("FRACTAL: Shard non trovato: source=" + action.sourceShard() + ", target=" + action.targetShard());
+                    continue;
                 }
 
-                // 4. Pulizia del vecchio shard (Ordine inverso)
-                for (TableMigrationPlan plan : deletePlans) {
-                    deleteTableData(userId, plan, source);
+                String existingPhase = topologyManager != null ? topologyManager.getMigrationPhase(userId) : null;
+                boolean sourceHasData = hasRootRecord(userId, props.getRootTable(), props.getRootIdColumn(), source);
+                boolean targetHasData = hasRootRecord(userId, props.getRootTable(), props.getRootIdColumn(), target);
+
+                if (!sourceHasData && targetHasData) {
+                    // Migration has already completed previously (e.g. repeated action or crash after prune)
+                    System.out.println("FRACTAL: Utente " + userId + " già presente su " + action.targetShard() + ", migrazione già completata.");
+                } else if (TopologyManager.PHASE_PRUNING.equalsIgnoreCase(existingPhase)) {
+                    // Previous run completed COPYING before interruption; resume by finishing PRUNING
+                    System.out.println("FRACTAL: Ripresa migrazione da fase PRUNING per " + userId);
+                    for (TableMigrationPlan plan : deletePlans) {
+                        deleteTableData(userId, plan, source);
+                    }
+                } else {
+                    // Fresh migration or previous run was interrupted during COPYING
+                    if (topologyManager != null) {
+                        topologyManager.recordMigrationStart(userId, action.sourceShard(), action.targetShard());
+                    }
+
+                    // Idempotent target cleanup: remove any partial rows on target from previous aborted copy
+                    for (TableMigrationPlan plan : deletePlans) {
+                        deleteTableData(userId, plan, target);
+                    }
+
+                    // Copy all tables in topological insert order
+                    for (TableMigrationPlan plan : insertPlans) {
+                        copyTableData(userId, plan, source, target);
+                    }
+
+                    // Transition to PRUNING phase
+                    if (topologyManager != null) {
+                        topologyManager.updateMigrationPhase(userId, TopologyManager.PHASE_PRUNING);
+                    }
+
+                    // Prune data from old shard in reverse topological order
+                    for (TableMigrationPlan plan : deletePlans) {
+                        deleteTableData(userId, plan, source);
+                    }
+                }
+
+                // Clear migration tracking record
+                if (topologyManager != null) {
+                    topologyManager.clearMigrationRecord(userId);
                 }
 
                 // 5. Sblocco del Tenant (Imposta ACTIVE in DB e in TopologyManager)
@@ -95,7 +135,6 @@ public class RebalanceEngine {
             } catch (Exception e) {
                 System.err.println("FRACTAL: Errore critico durante la migrazione di " + userId);
                 e.printStackTrace();
-                // In caso di errore, lasciamo il tenant in stato MIGRATING per sicurezza
             }
         }
     }
@@ -140,5 +179,18 @@ public class RebalanceEngine {
 
     private void deleteTableData(String userId, TableMigrationPlan plan, NamedParameterJdbcTemplate source) {
         source.update(plan.deleteSql(), Map.of("userId", userId));
+    }
+
+    private boolean hasRootRecord(String userId, String rootTable, String rootIdColumn, NamedParameterJdbcTemplate template) {
+        if (template == null || rootTable == null || rootIdColumn == null) {
+            return false;
+        }
+        try {
+            String sql = String.format("SELECT COUNT(*) FROM %s WHERE %s = :userId", rootTable, rootIdColumn);
+            Integer count = template.queryForObject(sql, Map.of("userId", userId), Integer.class);
+            return count != null && count > 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 }
