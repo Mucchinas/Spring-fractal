@@ -53,6 +53,7 @@ public class RebalanceEngine {
                 props.getRootTable(),
                 props.getRootIdColumn(),
                 props.getShardedTables(),
+                props.getReplicaTables(),
                 props.getExcludeTables(),
                 props.isShardAll()
         );

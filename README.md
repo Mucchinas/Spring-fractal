@@ -18,6 +18,13 @@ Fractal is an automated horizontal database sharding starter for Spring Boot 3 a
   - [Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, & @ShardedStatus)](#domain-entity-auto-discovery-shardedentity-shardedkey--shardedstatus)
   - [Database Catalog Dependency Resolution](#database-catalog-dependency-resolution)
   - [Rebalance Execution Lifecycle & Idempotent Crash Recovery](#rebalance-execution-lifecycle--idempotent-crash-recovery)
+- [Use Cases and Reference Configurations](#use-cases-and-reference-configurations)
+  - [Architecture Matrix](#architecture-matrix)
+  - [Profile 1: B2B Multi-Tenant SaaS (Zero-Config)](#profile-1-b2b-multi-tenant-saas-zero-config)
+  - [Profile 2: High-Throughput User / Account Partitioning (SpEL)](#profile-2-high-throughput-user--account-partitioning-spel)
+  - [Profile 3: Turnkey Legacy Catalog Sharding (shard-all)](#profile-3-turnkey-legacy-catalog-sharding-shard-all)
+  - [Profile 4: Read-Mostly Reference Replication & Broadcasting](#profile-4-read-mostly-reference-replication--broadcasting)
+  - [Profile 5: Asynchronous Worker / Event-Consumer Nodes](#profile-5-asynchronous-worker--event-consumer-nodes)
 - [Configuration Reference](#configuration-reference)
   - [Property Specifications](#property-specifications)
   - [Configuration Example](#configuration-example)
@@ -303,7 +310,7 @@ When domain entity annotations are not used, `TableDependencyResolver` (`neko.mu
 4. **Topological Ordering**: Executes **Kahn's Algorithm (Topological Sort)** to produce:
    - **Insert Order**: Root/parent tables first, followed by child tables down to leaves.
    - **Delete Order**: The exact reverse of the insert order (leaf child tables first, root tables last).
-5. **Catalog-Wide Sharding (`shard-all`)**: When `fractal.sharding.rebalancer.shard-all: true`, the rebalancer automatically discovers and shards all base user tables in the database schema, completely ignoring `@ShardedEntity` annotations. System schemas (`pg_catalog`, `information_schema`, `sys`, etc.) and internal Fractal tables are filtered out automatically, and tables defined in `exclude-tables` are excluded. Topological migration order and foreign key hopping paths are computed from the database catalog.
+5. **Catalog-Wide Sharding (`shard-all`)**: When `fractal.sharding.rebalancer.shard-all: true`, the rebalancer automatically inspects all base user tables in the database catalog, ignoring `@ShardedEntity`. System schemas (`pg_catalog`, `information_schema`, `sys`, etc.) and internal Fractal tables are filtered out automatically, and tables defined in `exclude-tables` are excluded. Tables connected via foreign key paths to `rootTable` are partitioned and topologically ordered for migration. Tables without foreign key relationships to `rootTable` are automatically classified as **replicated tables** and synchronized across all shards to enable local SQL joins without partitioning.
 
 ### Rebalance Execution Lifecycle & Idempotent Crash Recovery
 
@@ -353,6 +360,191 @@ A dedicated single-threaded task executor (`fractalRebalanceExecutor`) configure
 
 ---
 
+## Use Cases and Reference Configurations
+
+Fractal is engineered to support a broad spectrum of distributed database architectures, from greenfield B2B SaaS multi-tenancy to high-throughput B2C consumer platforms, legacy schema sharding, and event-driven worker clusters.
+
+### Architecture Matrix
+
+| Architecture Profile | Sharding Key Source | Entity Discovery Strategy | Rebalancing & Migrations | Replica & Reference Tables | Ideal For |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Profile 1: B2B Multi-Tenant SaaS** | JWT Security Claim (`tenant_id`, `org_id`) | Domain Annotations (`@ShardedEntity`, `@ShardedKey`, `@ShardedStatus`) | Automated Rebalancer (`enabled: true`, zero-config) | [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedReplica.java) + [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedBroadcast.java) for lookup tables | Multi-tenant SaaS with authenticated enterprise tenants |
+| **Profile 2: High-Throughput User / Account Partitioning** | Service Method SpEL (`#userId`, `#accountId`) | Domain Annotations or Database Catalog | Automated Rebalancer (`enabled: true`) | Replicated reference tables (`currencies`, `tiers`) | B2C E-Commerce, FinTech, social feeds, gaming platforms |
+| **Profile 3: Turnkey Legacy Catalog Sharding** | JWT or Method SpEL | Database Catalog Introspection (`shard-all: true`) | Automated Rebalancer (`enabled: true`, topological sort) | Unconnected tables auto-replicated to all shards | Existing relational databases with established foreign key constraints |
+| **Profile 4: Read-Mostly Reference Replication** | JWT or Method SpEL | Domain Entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedReplica.java) | Optional | Startup sync via [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/rebalance/ReplicaTableSynchronizer.java) + parallel [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedBroadcast.java) | Global reference catalogs requiring local shard joins |
+| **Profile 5: Asynchronous Worker / Event Consumer** | Method SpEL on Message Payload (`#event.tenantId`) | N/A (Stateless Routing) | Disabled (`rebalancer.enabled: false`) | Local caching or primary queries | Background jobs, Kafka/RabbitMQ consumers, batch workers |
+
+---
+
+### Profile 1: B2B Multi-Tenant SaaS (Zero-Config)
+
+In this canonical scenario, incoming REST requests carry a JWT containing a tenant identifier claim (such as `org_id` or `tenant_id`). Business entities belong to an organization and require total data isolation across physical database shards.
+
+- **Entity Design**: The root entity is annotated with [`@ShardedEntity(root = true)`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedKey.java), and [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedStatus.java). Descendants hop back to root using [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedKey.java).
+- **Zero-Config YAML**: Rebalancing properties (`root-table`, `root-id-column`, `status-column`, `sharded-tables`) are omitted because Fractal infers them automatically.
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    virtual-nodes: 150
+    jwt:
+      claim-name: org_id
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/saas_primary
+      username: saas_admin
+      password: ${DB_PASS}
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-shard1:5432/saas_shard1
+        username: saas_user
+        password: ${DB_PASS}
+      shard-2:
+        jdbc-url: jdbc:postgresql://db-shard2:5432/saas_shard2
+        username: saas_user
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+      lock-timeout: 15m
+      lock-refresh-interval: 1m
+```
+
+---
+
+### Profile 2: High-Throughput User / Account Partitioning (SpEL)
+
+For B2C consumer applications (such as banking, mobile wallets, or e-commerce), requests are routed based on specific business entities (e.g. `userId` or `accountId`) passed as method parameters.
+
+- **Method Annotation**: Methods are annotated with [`@Sharded(key = "#userId")`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/Sharded.java).
+- **Higher Virtual Node Density**: Higher `virtual-nodes` (e.g., 250) can be configured to ensure an ultra-uniform distribution across a large number of physical shards.
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    virtual-nodes: 250
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/fintech_primary
+      username: admin
+      password: ${DB_PASS}
+    shards:
+      shard-alpha:
+        jdbc-url: jdbc:postgresql://db-alpha:5432/fintech_shard_alpha
+        username: app_user
+        password: ${DB_PASS}
+      shard-beta:
+        jdbc-url: jdbc:postgresql://db-beta:5432/fintech_shard_beta
+        username: app_user
+        password: ${DB_PASS}
+      shard-gamma:
+        jdbc-url: jdbc:postgresql://db-gamma:5432/fintech_shard_gamma
+        username: app_user
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+```
+
+---
+
+### Profile 3: Turnkey Legacy Catalog Sharding (shard-all)
+
+For existing monolithic systems with complex database schemas that already enforce relational foreign keys, Fractal can inspect the database catalog directly without modifying Java entity models.
+
+- **Automated Catalog Introspection**: Setting `fractal.sharding.rebalancer.shard-all: true` directs [`TableDependencyResolver`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/rebalance/TableDependencyResolver.java) to discover all base user tables.
+- **Automatic Replica Separation**: Tables connected to the root table are partitioned. Tables without foreign keys to the root are automatically treated as replica tables and synced to all shards.
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/legacy_primary
+      username: dba
+      password: ${DB_PASS}
+    shards:
+      shard-01:
+        jdbc-url: jdbc:postgresql://db-shard01:5432/legacy_shard01
+        username: app
+        password: ${DB_PASS}
+      shard-02:
+        jdbc-url: jdbc:postgresql://db-shard02:5432/legacy_shard02
+        username: app
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+      shard-all: true
+      root-table: customers
+      root-id-column: customer_id
+      status-column: sync_status
+      exclude-tables:
+        - flyway_schema_history
+        - audit_events
+```
+
+---
+
+### Profile 4: Read-Mostly Reference Replication & Broadcasting
+
+Applications with high-velocity joins between sharded transaction data (e.g. orders, invoices) and global reference data (e.g. currencies, tax codes, catalog items).
+
+- **Entity Annotation**: Reference entities are annotated with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedReplica.java).
+- **Mutations**: Admin update services are annotated with [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedBroadcast.java) to write concurrently to primary and all physical shards.
+- **Local Zero-Latency Joins**: Repositories execute native SQL joins on the shard without cross-database calls.
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/shop_primary
+      username: admin
+      password: ${DB_PASS}
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-s1:5432/shop_shard1
+        username: app
+        password: ${DB_PASS}
+      shard-2:
+        jdbc-url: jdbc:postgresql://db-s2:5432/shop_shard2
+        username: app
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: false # Rebalancer can be disabled if shards are static; replica sync still runs on startup
+```
+
+---
+
+### Profile 5: Asynchronous Worker / Event-Consumer Nodes
+
+In a horizontally scaled deployment with dedicated background worker pods (e.g., Spring Cloud Stream, Kafka listeners, or `@Scheduled` jobs), worker nodes only need to route individual events to the correct physical shard.
+
+- **Rebalancer Disabled**: Avoid running rebalance listeners on worker nodes; leave rebalancing to a single designated coordinator or administrative deployment.
+- **Message Payload Routing**: Annotate message listener methods with [`@Sharded(key = "#event.tenantId")`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/Sharded.java).
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/cluster_primary
+      username: worker_user
+      password: ${DB_PASS}
+      initialize-schema: false # Schema managed by main API service
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-shard1:5432/cluster_shard1
+        username: worker_user
+        password: ${DB_PASS}
+      shard-2:
+        jdbc-url: jdbc:postgresql://db-shard2:5432/cluster_shard2
+        username: worker_user
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: false # Background workers should not orchestrate migrations
+```
+
+---
+
 ## Configuration Reference
 
 ### Property Specifications
@@ -381,6 +573,7 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.rebalancer.migrating-value` | `String` | `MIGRATING` | State string set during an in-flight migration. Inferred from `@ShardedStatus(migratingValue = ...)` if omitted. |
 | `fractal.sharding.rebalancer.active-value` | `String` | `ACTIVE` | State string when tenant is available. Inferred from `@ShardedStatus(activeValue = ...)` if omitted. |
 | `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedEntity` domain models or foreign key graph. |
+| `fractal.sharding.rebalancer.replica-tables` | `List<String>` | `null` | Optional explicit list of reference tables to replicate across all shards. Inferred from `@ShardedReplica` or catalog when `shard-all: true`. |
 | `fractal.sharding.rebalancer.exclude-tables` | `List<String>` | `null` | Optional list of tables to exclude from auto-discovery. |
 
 ### Configuration Example
@@ -426,6 +619,9 @@ fractal:
       #   - organizations
       #   - projects
       #   - tasks
+      # replica-tables:           # Inferred from @ShardedReplica (or auto-detected when shard-all: true)
+      #   - currencies
+      #   - system_roles
       # Optional: exclude specific tables from auto-discovery
       exclude-tables:
         - flyway_schema_history
@@ -656,9 +852,55 @@ public class OrderReportingFacade {
 
 #### Pattern 2: Broadcast / Replicated Tables (For High-Frequency Lookups)
 
-If the non-sharded data consists of read-mostly reference data (such as currency codes, country lists, categories, or tax rate tables):
-- Replicate the reference tables to **every physical shard** using database migration scripts (Flyway) or asynchronous change data capture.
-- Sharded service methods can then execute native, high-performance SQL `JOIN` queries directly inside the local shard database.
+When non-sharded data consists of read-mostly reference data (such as currency codes, country lists, tenant roles, or tax rates), querying across network boundaries or through orchestration facades introduces unwanted latency. Fractal provides first-class support for **Broadcast / Replicated Tables**:
+
+1. **Declarative Reference Entities (`@ShardedReplica`)**:
+   Annotate reference domain entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedReplica.java). Fractal's metadata resolver automatically registers these tables for cluster-wide replication instead of tenant partitioning:
+
+   ```java
+   @Entity
+   @Table(name = "currencies")
+   @ShardedReplica
+   public class Currency {
+       @Id
+       private String code;
+       private String name;
+       private BigDecimal exchangeRate;
+   }
+   ```
+
+2. **Automatic Startup & Cluster Expansion Synchronization (`ReplicaTableSynchronizer`)**:
+   On application startup (and whenever a new physical shard joins the cluster), [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/rebalance/ReplicaTableSynchronizer.java) automatically copies all rows from the primary coordination database to every physical shard. Because reference tables are present locally on each shard, sharded service methods can execute native, zero-latency SQL `JOIN` operations:
+
+   ```java
+   @Repository
+   public interface OrderRepository extends JpaRepository<Order, UUID> {
+       // High-performance local SQL JOIN between sharded orders and replicated currencies
+       @Query("SELECT o FROM Order o JOIN Currency c ON o.currency = c.code WHERE o.organization.id = :orgId")
+       List<Order> findWithCurrency(@Param("orgId") String orgId);
+   }
+   ```
+
+3. **Multi-Shard Parallel Writes (`@ShardedBroadcast`)**:
+   When updating reference data, annotate the mutation method with [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/annotation/ShardedBroadcast.java). Fractal's [`ShardedBroadcastAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/neko/mukynas/fractal/aop/ShardedBroadcastAspect.java) intercepts execution and executes the write mutation across the primary database and all physical shards concurrently in parallel:
+
+   ```java
+   @Service
+   public class CurrencyAdminService {
+       private final CurrencyRepository currencyRepository;
+
+       @ShardedBroadcast // Writes to primary and all physical shards concurrently
+       @Transactional
+       public Currency updateExchangeRate(String code, BigDecimal newRate) {
+           Currency currency = currencyRepository.findById(code).orElseThrow();
+           currency.setExchangeRate(newRate);
+           return currencyRepository.save(currency);
+       }
+   }
+   ```
+
+4. **Preserved During Tenant Rebalancing**:
+   Unlike sharded tenant tables, replicated tables are filtered out of tenant migration delta plans. Moving a tenant from one shard to another will **never** delete or prune replicated reference rows on either source or target shards.
 
 #### Pattern 3: In-Memory / Distributed Caching
 
@@ -729,17 +971,19 @@ Execute the unit and integration test suite:
 mvn clean test
 ```
 
-The test suite covers 42 automated tests across 12 test suites:
+The test suite covers 52 automated tests across 14 test suites:
 - `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes on the 64-bit ring.
 - `RoutingIntegrationTest`: Verifies dynamic shard selection, primary fallback, and SpEL resolution using in-memory H2 databases.
 - `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens (`sub` claim) in `SecurityContextHolder`.
 - `CustomClaimSecurityRoutingIntegrationTest`: Tests end-to-end shard routing using custom JWT claims (e.g. `tenant_id`).
 - `JwtSecurityKeyExtractorTest`: Validates custom claim extraction, fallback logic, string/numeric/UUID claim conversions, and unauthenticated state handling.
 - `ShardingAspectMigrationLockTest`: Asserts that `TenantMigratingException` is thrown when accessing a tenant currently flagged as migrating.
-- `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution (`users` -> `projects` -> `tasks`), Kahn's topological sort for insert/delete ordering, join query synthesis, and table exclusion.
-- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity`, `@ShardedKey`, and `@ShardedStatus`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
-- `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans and `@ShardedStatus`.
+- `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution (`users` -> `projects` -> `tasks`), Kahn's topological sort for insert/delete ordering, join query synthesis, table exclusion, and replica table isolation.
+- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity`, `@ShardedKey`, `@ShardedStatus`, and `@ShardedReplica`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
+- `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans and `@ShardedStatus`, while ensuring replicated tables (`currencies`) are preserved on all shards.
 - `RebalanceEngineTest`: Validates end-to-end tenant migration, row copying across shards using multi-hop plans, and reverse-order row pruning.
+- `ReplicaTableSynchronizerTest`: Tests batch synchronization of reference tables from primary coordinator to shards and new shard catch-up.
+- `ShardedBroadcastAspectTest`: Confirms parallel broadcast writes across primary database and all physical shards for `@ShardedBroadcast` service methods.
 - `TopologyManagerLockTest`: Verifies distributed lock acquisition, mutual exclusion, expired lock takeover via configurable TTL, periodic heartbeat renewal, graceful shutdown lock release, automatic schema initialization via `InitializingBean`, and idempotent ANSI shard registration.
 - `RebalanceEngineIdempotencyTest`: Asserts idempotent crash recovery across migration phases, resumption from aborted `COPYING` state (purging partial target data and recopying), resumption from aborted `PRUNING` state (safe source pruning without duplicate inserts), and safe repeated execution without side effects.
 

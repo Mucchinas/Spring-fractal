@@ -294,4 +294,40 @@ class EntityTableMetadataResolverTest {
         );
         assertTrue(ex.getMessage().contains("is only permitted on the root entity"));
     }
+
+    // 13. Replicated tables (@ShardedReplica)
+    @neko.mukynas.fractal.annotation.ShardedReplica(table = "currencies")
+    static class Currency {
+        private String code;
+        private Double rate;
+    }
+
+    @neko.mukynas.fractal.annotation.ShardedReplica
+    @Table(name = "system_roles")
+    static class Role {
+        private String roleName;
+    }
+
+    @Test
+    void shouldResolveShardedReplicaTables() {
+        EntityMetadataResult result = resolver.resolveFromClasses(
+                List.of(Organization.class, Project.class, Currency.class, Role.class)
+        );
+
+        assertNotNull(result);
+        assertEquals(List.of("currencies", "system_roles"), result.replicaTables());
+        assertEquals(List.of("organization", "project"), result.shardedTables());
+    }
+
+    @Test
+    void shouldResolveOnlyReplicaTablesWhenNoShardedEntityPresent() {
+        EntityMetadataResult result = resolver.resolveFromClasses(
+                List.of(Currency.class, Role.class)
+        );
+
+        assertNotNull(result);
+        assertNull(result.rootTable());
+        assertTrue(result.shardedTables().isEmpty());
+        assertEquals(List.of("currencies", "system_roles"), result.replicaTables());
+    }
 }

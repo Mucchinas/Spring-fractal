@@ -3,6 +3,7 @@ package neko.mukynas.fractal.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -44,9 +45,18 @@ public class FractalProperties {
         private String activeValue = "ACTIVE";
 
         private List<String> shardedTables;
+        private List<String> replicaTables = new ArrayList<>();
         private List<String> excludeTables;
         private Duration lockTimeout = Duration.ofMinutes(15);
         private Duration lockRefreshInterval = Duration.ofMinutes(1);
+
+        public List<String> getReplicaTables() {
+            return replicaTables;
+        }
+
+        public void setReplicaTables(List<String> replicaTables) {
+            this.replicaTables = replicaTables;
+        }
 
         public Duration getLockTimeout() {
             return lockTimeout;

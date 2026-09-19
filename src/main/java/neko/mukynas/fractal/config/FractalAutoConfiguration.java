@@ -3,12 +3,14 @@ package neko.mukynas.fractal.config;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import neko.mukynas.fractal.aop.ShardingAspect;
+import neko.mukynas.fractal.aop.ShardedBroadcastAspect;
 import neko.mukynas.fractal.core.ConsistentHashRouter;
 import neko.mukynas.fractal.core.ShardingKeyExtractor;
 import neko.mukynas.fractal.datasource.ShardingRoutingDataSource;
 import org.springframework.beans.factory.ObjectProvider;
 import neko.mukynas.fractal.rebalance.MigrationDeltaCalculator;
 import neko.mukynas.fractal.rebalance.RebalanceEngine;
+import neko.mukynas.fractal.rebalance.ReplicaTableSynchronizer;
 import neko.mukynas.fractal.rebalance.TableDependencyResolver;
 import neko.mukynas.fractal.rebalance.TopologyManager;
 import neko.mukynas.fractal.rebalance.EntityMetadataResult;
@@ -27,6 +29,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 
 import javax.sql.DataSource;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -140,22 +143,58 @@ public class FractalAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean
+    public ReplicaTableSynchronizer replicaTableSynchronizer(FractalProperties properties) {
+        DataSource primary = buildDataSource(properties.getPrimary());
+        return new ReplicaTableSynchronizer(primary, properties);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public ShardedBroadcastAspect shardedBroadcastAspect(FractalProperties properties) {
+        return new ShardedBroadcastAspect(properties);
+    }
+
+    @Bean
     public CommandLineRunner fractalStartupListener(TopologyManager topologyManager,
                                                      TableDependencyResolver dependencyResolver,
                                                      RebalanceEngine rebalanceEngine,
                                                      ThreadPoolTaskExecutor fractalRebalanceExecutor,
                                                      FractalProperties properties,
-                                                     EntityTableMetadataResolver entityMetadataResolver) {
+                                                     EntityTableMetadataResolver entityMetadataResolver,
+                                                     ReplicaTableSynchronizer replicaTableSynchronizer) {
         return args -> {
-            if (properties.getRebalancer().isEnabled()) {
-                if (properties.getRebalancer().isShardAll()) {
-                    List<String> allTables = dependencyResolver.discoverAllDatabaseTables(properties.getRebalancer().getExcludeTables());
-                    properties.getRebalancer().setShardedTables(allTables);
-                } else {
-                    // Infer root-table, root-id-column, and sharded-tables from entities if not explicitly configured in YAML
-                    try {
-                        EntityMetadataResult entityResult = entityMetadataResolver.resolve();
-                        if (entityResult != null && entityResult.rootTable() != null) {
+            if (properties.getRebalancer().isShardAll()) {
+                List<String> replicaTables = dependencyResolver.discoverReplicaTables(
+                        properties.getRebalancer().getRootTable(),
+                        properties.getRebalancer().getReplicaTables(),
+                        properties.getRebalancer().getExcludeTables(),
+                        true
+                );
+                List<String> shardedTables = dependencyResolver.discoverShardedTables(
+                        properties.getRebalancer().getRootTable(),
+                        null,
+                        replicaTables,
+                        properties.getRebalancer().getExcludeTables(),
+                        true
+                );
+                properties.getRebalancer().setReplicaTables(replicaTables);
+                properties.getRebalancer().setShardedTables(shardedTables);
+            } else {
+                // Infer root-table, root-id-column, replica-tables, and sharded-tables from entities if not explicitly configured in YAML
+                try {
+                    EntityMetadataResult entityResult = entityMetadataResolver.resolve();
+                    if (entityResult != null) {
+                        if (entityResult.replicaTables() != null && !entityResult.replicaTables().isEmpty()) {
+                            List<String> combinedReplicas = new ArrayList<>(properties.getRebalancer().getReplicaTables());
+                            for (String rep : entityResult.replicaTables()) {
+                                if (!combinedReplicas.contains(rep)) {
+                                    combinedReplicas.add(rep);
+                                }
+                            }
+                            properties.getRebalancer().setReplicaTables(combinedReplicas);
+                        }
+                        if (entityResult.rootTable() != null) {
                             if (properties.getRebalancer().getRootTable() == null) {
                                 properties.getRebalancer().setRootTable(entityResult.rootTable());
                             }
@@ -175,11 +214,16 @@ public class FractalAutoConfiguration {
                                 properties.getRebalancer().setShardedTables(entityResult.shardedTables());
                             }
                         }
-                    } catch (Exception e) {
-                        System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
                     }
+                } catch (Exception e) {
+                    System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
                 }
+            }
 
+            // Synchronize all replica reference tables across physical shards on startup
+            replicaTableSynchronizer.syncAllReplicaTables(properties.getRebalancer().getReplicaTables());
+
+            if (properties.getRebalancer().isEnabled()) {
                 // 1. Crea le tabelle se non esistono
                 topologyManager.initializeSchema();
 
@@ -207,7 +251,10 @@ public class FractalAutoConfiguration {
                             try {
                                 if (properties.getRebalancer().getRootTable() == null || properties.getRebalancer().getRootIdColumn() == null) {
                                     System.out.println("FRACTAL: Rebalancer abilitato ma root-table o root-id-column non configurati. Registrazione shard.");
-                                    yamlShards.forEach(topologyManager::registerNewShard);
+                                    yamlShards.forEach(s -> {
+                                        topologyManager.registerNewShard(s);
+                                        replicaTableSynchronizer.syncAllReplicaTablesToShard(s, properties.getRebalancer().getReplicaTables());
+                                    });
                                     return;
                                 }
 
@@ -228,7 +275,10 @@ public class FractalAutoConfiguration {
                                     List<MigrationDeltaCalculator.MigrationAction> actions =
                                             calculator.calculateDelta(dbShards, yamlShards, properties.getVirtualNodes());
                                     rebalanceEngine.executeMigration(actions);
-                                    yamlShards.forEach(topologyManager::registerNewShard);
+                                    yamlShards.forEach(s -> {
+                                        topologyManager.registerNewShard(s);
+                                        replicaTableSynchronizer.syncAllReplicaTablesToShard(s, properties.getRebalancer().getReplicaTables());
+                                    });
                                 }
                             } catch (Exception e) {
                                 System.err.println("FRACTAL: Errore durante l'esecuzione del rebalancing automatico: " + e.getMessage());

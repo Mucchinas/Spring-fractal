@@ -2,6 +2,7 @@ package neko.mukynas.fractal.rebalance;
 
 import neko.mukynas.fractal.annotation.ShardedEntity;
 import neko.mukynas.fractal.annotation.ShardedKey;
+import neko.mukynas.fractal.annotation.ShardedReplica;
 import neko.mukynas.fractal.annotation.ShardedStatus;
 import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
@@ -17,7 +18,8 @@ import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * Discovers and validates entities annotated with {@link ShardedEntity} and {@link ShardedKey}.
+ * Discovers and validates entities annotated with {@link ShardedEntity}, {@link ShardedKey},
+ * and {@link ShardedReplica}.
  * Generates topological foreign key hops, root table mappings, and table discovery metadata.
  */
 public class EntityTableMetadataResolver {
@@ -34,7 +36,7 @@ public class EntityTableMetadataResolver {
 
     /**
      * Resolves metadata by scanning base packages of the Spring Boot application.
-     * Returns null if no @ShardedEntity classes are detected.
+     * Returns null if no @ShardedEntity or @ShardedReplica classes are detected.
      */
     public EntityMetadataResult resolve() {
         Set<Class<?>> entityClasses = scanEntityClasses();
@@ -52,11 +54,23 @@ public class EntityTableMetadataResolver {
             return null;
         }
 
+        List<Class<?>> replicaClasses = classes.stream()
+                .filter(c -> c.isAnnotationPresent(ShardedReplica.class))
+                .toList();
+
+        List<String> replicaTables = new ArrayList<>();
+        for (Class<?> clazz : replicaClasses) {
+            replicaTables.add(resolveReplicaTableName(clazz));
+        }
+
         List<Class<?>> shardedClasses = classes.stream()
                 .filter(c -> c.isAnnotationPresent(ShardedEntity.class))
                 .toList();
 
         if (shardedClasses.isEmpty()) {
+            if (!replicaTables.isEmpty()) {
+                return new EntityMetadataResult(null, null, null, null, null, Collections.emptyList(), Collections.emptyList(), replicaTables);
+            }
             return null;
         }
 
@@ -165,7 +179,7 @@ public class EntityTableMetadataResolver {
         // Compute insert order (Kahn's topological sort)
         List<String> insertOrder = computeTopologicalOrder(rootTable, tableNames.values(), foreignKeys);
 
-        return new EntityMetadataResult(rootTable, rootIdColumn, statusColumn, migratingValue, activeValue, insertOrder, foreignKeys);
+        return new EntityMetadataResult(rootTable, rootIdColumn, statusColumn, migratingValue, activeValue, insertOrder, foreignKeys, replicaTables);
     }
 
     private List<String> computeTopologicalOrder(String rootTable, Collection<String> allTables, List<TableForeignKey> fks) {
@@ -216,6 +230,29 @@ public class EntityTableMetadataResolver {
 
     public String resolveTableName(Class<?> clazz) {
         ShardedEntity ann = clazz.getAnnotation(ShardedEntity.class);
+        if (ann != null && !ann.table().isBlank()) {
+            return ann.table().toLowerCase();
+        }
+
+        // Check JPA @Table(name = "...") via reflection
+        try {
+            Class<?> tableAnnotationClass = Class.forName("jakarta.persistence.Table");
+            if (clazz.isAnnotationPresent((Class<? extends Annotation>) tableAnnotationClass)) {
+                Annotation tableAnn = clazz.getAnnotation((Class<? extends Annotation>) tableAnnotationClass);
+                Method nameMethod = tableAnn.annotationType().getMethod("name");
+                String name = (String) nameMethod.invoke(tableAnn);
+                if (name != null && !name.isBlank()) {
+                    return name.toLowerCase();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        return camelToSnakeCase(clazz.getSimpleName()).toLowerCase();
+    }
+
+    public String resolveReplicaTableName(Class<?> clazz) {
+        ShardedReplica ann = clazz.getAnnotation(ShardedReplica.class);
         if (ann != null && !ann.table().isBlank()) {
             return ann.table().toLowerCase();
         }
@@ -400,6 +437,7 @@ public class EntityTableMetadataResolver {
         ClassPathScanningCandidateComponentProvider scanner =
                 new ClassPathScanningCandidateComponentProvider(false);
         scanner.addIncludeFilter(new AnnotationTypeFilter(ShardedEntity.class));
+        scanner.addIncludeFilter(new AnnotationTypeFilter(ShardedReplica.class));
 
         Set<Class<?>> classes = new HashSet<>();
         for (String basePackage : packages) {

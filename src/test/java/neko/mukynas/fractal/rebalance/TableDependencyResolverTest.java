@@ -117,19 +117,25 @@ class TableDependencyResolverTest {
     }
 
     @Test
-    void shouldDiscoverShardedTablesWithShardAll() {
+    void shouldDiscoverShardedTablesWithShardAllSeparatingReplicaTables() {
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
-        jdbc.execute("CREATE TABLE independent_table (id VARCHAR(255) PRIMARY KEY, data VARCHAR(255))");
+        jdbc.execute("CREATE TABLE orders (id VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255), FOREIGN KEY (user_id) REFERENCES users(id))");
+        jdbc.execute("CREATE TABLE currencies (code VARCHAR(255) PRIMARY KEY, rate VARCHAR(255))");
 
-        List<String> sharded = resolver.discoverShardedTables("users", null, null, true);
+        List<String> replicas = resolver.discoverReplicaTables("users", null, null, true);
+        assertThat(replicas).contains("currencies");
+        assertThat(replicas).doesNotContain("users", "projects", "tasks", "comments", "orders");
+
+        List<String> sharded = resolver.discoverShardedTables("users", null, replicas, null, true);
         assertThat(sharded.get(0)).isEqualTo("users");
-        assertThat(sharded).contains("users", "projects", "tasks", "comments", "independent_table");
+        assertThat(sharded).contains("users", "projects", "tasks", "comments", "orders");
+        assertThat(sharded).doesNotContain("currencies");
     }
 
     @Test
     void shouldResolveMigrationPlansWithShardAll() {
         JdbcTemplate jdbc = new JdbcTemplate(dataSource);
-        jdbc.execute("CREATE TABLE notifications (user_id VARCHAR(255) PRIMARY KEY, msg VARCHAR(255))");
+        jdbc.execute("CREATE TABLE notifications (user_id VARCHAR(255) PRIMARY KEY, msg VARCHAR(255), FOREIGN KEY (user_id) REFERENCES users(id))");
 
         List<TableMigrationPlan> plans = resolver.resolveMigrationPlans("users", "id", null, null, true);
         assertThat(plans).anyMatch(p -> p.tableName().equals("users"));

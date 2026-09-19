@@ -210,6 +210,70 @@ class EntityRebalanceIntegrationTest {
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM notes WHERE org_id = 'org-99'", Integer.class));
     }
 
+    @Test
+    void shouldPreserveReplicatedTablesOnAllShardsDuringTenantMigration() {
+        String dropSql = "DROP TABLE IF EXISTS currencies; DROP TABLE IF EXISTS tasks; DROP TABLE IF EXISTS projects; DROP TABLE IF EXISTS organizations;";
+        new JdbcTemplate(primaryDs).execute(dropSql);
+        shard1Jdbc.execute(dropSql);
+        shard2Jdbc.execute(dropSql);
+
+        String schema = """
+            CREATE TABLE organizations (org_id VARCHAR(50) PRIMARY KEY, name VARCHAR(100), sync_status VARCHAR(20));
+            CREATE TABLE currencies (code VARCHAR(10) PRIMARY KEY, rate DECIMAL(10, 4));
+        """;
+        new JdbcTemplate(primaryDs).execute(schema);
+        shard1Jdbc.execute(schema);
+        shard2Jdbc.execute(schema);
+
+        // Seed currencies on primary and synchronize to both shards
+        new JdbcTemplate(primaryDs).update("INSERT INTO currencies (code, rate) VALUES ('EUR', 1.0)");
+        new JdbcTemplate(primaryDs).update("INSERT INTO currencies (code, rate) VALUES ('USD', 1.08)");
+
+        ReplicaTableSynchronizer synchronizer = new ReplicaTableSynchronizer(primaryDs, Map.of("shard-1", shard1Ds, "shard-2", shard2Ds));
+        synchronizer.syncAllReplicaTables(List.of("currencies"));
+
+        // Seed tenant data on shard1
+        shard1Jdbc.update("INSERT INTO organizations (org_id, name, sync_status) VALUES ('org-55', 'Acme Global', 'ACTIVE')");
+
+        TableDependencyResolver dependencyResolver = new TableDependencyResolver(primaryDs);
+
+        FractalProperties properties = new FractalProperties();
+        properties.getRebalancer().setRootTable("organizations");
+        properties.getRebalancer().setRootIdColumn("org_id");
+        properties.getRebalancer().setStatusColumn("sync_status");
+        properties.getRebalancer().setReplicaTables(List.of("currencies"));
+
+        FractalProperties.DataSourceProperties shard1Props = new FractalProperties.DataSourceProperties();
+        shard1Props.setJdbcUrl("jdbc:h2:mem:entity_rebal_shard1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
+        shard1Props.setUsername("sa");
+        shard1Props.setPassword("");
+
+        FractalProperties.DataSourceProperties shard2Props = new FractalProperties.DataSourceProperties();
+        shard2Props.setJdbcUrl("jdbc:h2:mem:entity_rebal_shard2;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
+        shard2Props.setUsername("sa");
+        shard2Props.setPassword("");
+
+        properties.setShards(Map.of("shard-1", shard1Props, "shard-2", shard2Props));
+
+        TopologyManager topologyManager = new TopologyManager(primaryDs);
+        topologyManager.initializeSchema();
+
+        RebalanceEngine engine = new RebalanceEngine(primaryDs, dependencyResolver, topologyManager, properties);
+
+        MigrationDeltaCalculator.MigrationAction action =
+                new MigrationDeltaCalculator.MigrationAction("org-55", "shard-1", "shard-2");
+
+        engine.executeMigration(List.of(action));
+
+        // Tenant migrated to shard-2 and pruned from shard-1
+        assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-55'", Integer.class));
+        assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-55'", Integer.class));
+
+        // Replicated reference table is PRESERVED on BOTH shards (never deleted during tenant prune)
+        assertEquals(2, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM currencies", Integer.class));
+        assertEquals(2, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM currencies", Integer.class));
+    }
+
     private HikariDataSource createDataSource(String url) {
         HikariConfig config = new HikariConfig();
         config.setJdbcUrl(url);
