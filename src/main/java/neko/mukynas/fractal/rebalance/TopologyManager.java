@@ -27,6 +27,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     private final String instanceId;
     private final boolean autoInitializeSchema;
     private final Set<String> activeMigratingTenants = ConcurrentHashMap.newKeySet();
+    private final ConcurrentMap<String, java.util.concurrent.atomic.LongAdder> inFlightRequests = new ConcurrentHashMap<>();
 
     private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "fractal-lock-heartbeat");
@@ -72,6 +73,47 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         if (tenantId != null) {
             activeMigratingTenants.remove(tenantId);
         }
+    }
+
+    public void registerRequestStart(String tenantId) {
+        if (tenantId != null) {
+            inFlightRequests.computeIfAbsent(tenantId, k -> new java.util.concurrent.atomic.LongAdder()).increment();
+        }
+    }
+
+    public void registerRequestEnd(String tenantId) {
+        if (tenantId != null) {
+            java.util.concurrent.atomic.LongAdder adder = inFlightRequests.get(tenantId);
+            if (adder != null) {
+                adder.decrement();
+            }
+        }
+    }
+
+    public long getInFlightRequestCount(String tenantId) {
+        if (tenantId == null) return 0;
+        java.util.concurrent.atomic.LongAdder adder = inFlightRequests.get(tenantId);
+        return adder != null ? Math.max(0, adder.sum()) : 0;
+    }
+
+    public boolean awaitTenantQuiescence(String tenantId, Duration timeout) {
+        if (tenantId == null) return true;
+        long timeoutMillis = timeout != null ? timeout.toMillis() : 5000;
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        while (System.currentTimeMillis() < deadline) {
+            java.util.concurrent.atomic.LongAdder adder = inFlightRequests.get(tenantId);
+            if (adder == null || adder.sum() <= 0) {
+                return true;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        java.util.concurrent.atomic.LongAdder adder = inFlightRequests.get(tenantId);
+        return adder == null || adder.sum() <= 0;
     }
 
     public boolean isTenantMigrating(String tenantId, neko.mukynas.fractal.config.FractalProperties.RebalancerProperties props) {

@@ -49,6 +49,10 @@ public class FractalProperties {
         private List<String> excludeTables;
         private Duration lockTimeout = Duration.ofMinutes(15);
         private Duration lockRefreshInterval = Duration.ofMinutes(1);
+        private Duration quiescencePeriod = Duration.ZERO;
+        private Duration drainTimeout = Duration.ofSeconds(10);
+        private int batchSize = 500;
+        private int maxBatchParameters = 32766;
 
         public List<String> getReplicaTables() {
             return replicaTables;
@@ -144,6 +148,46 @@ public class FractalProperties {
 
         public void setEnabled(boolean enabled) {
             this.enabled = enabled;
+        }
+
+        public int calculateBatchSize(int columnCount) {
+            if (columnCount <= 0) {
+                return Math.max(1, batchSize);
+            }
+            int dynamicLimit = maxBatchParameters / columnCount;
+            return Math.max(1, Math.min(batchSize, dynamicLimit));
+        }
+
+        public Duration getQuiescencePeriod() {
+            return quiescencePeriod;
+        }
+
+        public void setQuiescencePeriod(Duration quiescencePeriod) {
+            this.quiescencePeriod = quiescencePeriod;
+        }
+
+        public Duration getDrainTimeout() {
+            return drainTimeout;
+        }
+
+        public void setDrainTimeout(Duration drainTimeout) {
+            this.drainTimeout = drainTimeout;
+        }
+
+        public int getBatchSize() {
+            return batchSize;
+        }
+
+        public void setBatchSize(int batchSize) {
+            this.batchSize = batchSize;
+        }
+
+        public int getMaxBatchParameters() {
+            return maxBatchParameters;
+        }
+
+        public void setMaxBatchParameters(int maxBatchParameters) {
+            this.maxBatchParameters = maxBatchParameters;
         }
     }
 

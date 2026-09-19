@@ -76,23 +76,31 @@ public class ShardingAspect {
                     "SecurityContext vuoto/assente e parametro SpEL 'key' non fornito o nullo.");
         }
 
-        // 3.5. Verifica stato migrazione (se il rebalancer è attivo)
+        // 3.5. In-flight request tracking and migration status check
         TopologyManager topologyManager = topologyManagerProvider != null ? topologyManagerProvider.getIfAvailable() : null;
         FractalProperties properties = propertiesProvider != null ? propertiesProvider.getIfAvailable() : null;
-        if (topologyManager != null && properties != null && properties.getRebalancer().isEnabled()) {
-            if (topologyManager.isTenantMigrating(shardingKey, properties.getRebalancer())) {
-                throw new TenantMigratingException(shardingKey);
-            }
+
+        if (topologyManager != null) {
+            topologyManager.registerRequestStart(shardingKey);
         }
 
-        // 4. Routing verso il nodo virtuale
-        String targetShard = router.routeNode(shardingKey);
-        ShardContextHolder.setShard(targetShard);
-
         try {
+            if (topologyManager != null && properties != null && properties.getRebalancer().isEnabled()) {
+                if (topologyManager.isTenantMigrating(shardingKey, properties.getRebalancer())) {
+                    throw new TenantMigratingException(shardingKey);
+                }
+            }
+
+            // 4. Routing verso il nodo virtuale
+            String targetShard = router.routeNode(shardingKey);
+            ShardContextHolder.setShard(targetShard);
+
             // 5. Eseguiamo la query sul DB corretto
             return joinPoint.proceed();
         } finally {
+            if (topologyManager != null) {
+                topologyManager.registerRequestEnd(shardingKey);
+            }
             // 6. Pulizia ThreadLocal obbligatoria
             ShardContextHolder.clear();
         }

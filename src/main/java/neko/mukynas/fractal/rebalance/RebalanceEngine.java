@@ -28,13 +28,10 @@ public class RebalanceEngine {
                            TableDependencyResolver dependencyResolver,
                            TopologyManager topologyManager,
                            FractalProperties properties) {
-        this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
-        this.dependencyResolver = dependencyResolver;
-        this.topologyManager = topologyManager;
-        this.props = properties.getRebalancer();
+        this(primaryDataSource, dependencyResolver, topologyManager, properties != null ? properties.getRebalancer() : new FractalProperties.RebalancerProperties());
 
         // Inizializziamo i template JDBC per ogni shard fisico
-        if (properties.getShards() != null) {
+        if (properties != null && properties.getShards() != null) {
             properties.getShards().forEach((name, dbProps) -> {
                 HikariConfig config = new HikariConfig();
                 config.setJdbcUrl(dbProps.getJdbcUrl());
@@ -42,6 +39,29 @@ public class RebalanceEngine {
                 config.setPassword(dbProps.getPassword());
                 this.shardTemplates.put(name, new NamedParameterJdbcTemplate(new HikariDataSource(config)));
             });
+        }
+    }
+
+    public RebalanceEngine(DataSource primaryDataSource,
+                           TableDependencyResolver dependencyResolver,
+                           TopologyManager topologyManager,
+                           FractalProperties.RebalancerProperties props) {
+        this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
+        this.dependencyResolver = dependencyResolver;
+        this.topologyManager = topologyManager;
+        this.props = props != null ? props : new FractalProperties.RebalancerProperties();
+    }
+
+    public RebalanceEngine(DataSource primaryDataSource,
+                           Map<String, DataSource> shardDataSources,
+                           TableDependencyResolver dependencyResolver,
+                           TopologyManager topologyManager,
+                           FractalProperties.RebalancerProperties props) {
+        this(primaryDataSource, dependencyResolver, topologyManager, props);
+        if (shardDataSources != null) {
+            shardDataSources.forEach((name, ds) ->
+                    this.shardTemplates.put(name, new NamedParameterJdbcTemplate(ds))
+            );
         }
     }
 
@@ -73,6 +93,28 @@ public class RebalanceEngine {
                     topologyManager.markTenantMigrating(userId);
                 }
                 setTenantStatus(userId, props.getMigratingValue());
+
+                // 2.1 Drain in-flight requests that started prior to migration lock
+                if (topologyManager != null) {
+                    java.time.Duration drainTimeout = props.getDrainTimeout() != null ? props.getDrainTimeout() : java.time.Duration.ofSeconds(10);
+                    boolean drained = topologyManager.awaitTenantQuiescence(userId, drainTimeout);
+                    if (!drained) {
+                        System.err.println("FRACTAL: In-flight requests for tenant " + userId +
+                                " did not drain within " + drainTimeout + ". Deferring migration.");
+                        setTenantStatus(userId, props.getActiveValue());
+                        topologyManager.markTenantActive(userId);
+                        continue;
+                    }
+                }
+
+                // 2.2 Cluster quiescence pause to allow distributed transactions to finish committing
+                if (props.getQuiescencePeriod() != null && !props.getQuiescencePeriod().isZero() && !props.getQuiescencePeriod().isNegative()) {
+                    try {
+                        Thread.sleep(props.getQuiescencePeriod().toMillis());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
 
                 NamedParameterJdbcTemplate source = shardTemplates.get(action.sourceShard());
                 NamedParameterJdbcTemplate target = shardTemplates.get(action.targetShard());
@@ -168,8 +210,9 @@ public class RebalanceEngine {
 
         String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", plan.tableName(), columns, placeholders);
 
-        // Esecuzione batch in chunk per contenere l'uso di memoria
-        int batchSize = 500;
+        // Calcolo dinamico della dimensione del batch per prevenire limiti sui parametri JDBC (es. Postgres 65535, SQLite 32766)
+        int columnCount = firstRow.keySet().size();
+        int batchSize = props.calculateBatchSize(columnCount);
         for (int i = 0; i < rows.size(); i += batchSize) {
             List<Map<String, Object>> chunk = rows.subList(i, Math.min(i + batchSize, rows.size()));
             MapSqlParameterSource[] batchArgs = chunk.stream()

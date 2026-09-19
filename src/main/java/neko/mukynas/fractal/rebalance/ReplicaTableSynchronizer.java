@@ -21,11 +21,15 @@ public class ReplicaTableSynchronizer {
 
     private final NamedParameterJdbcTemplate primaryTemplate;
     private final Map<String, NamedParameterJdbcTemplate> shardTemplates = new HashMap<>();
+    private final FractalProperties.RebalancerProperties rebalancerProps;
 
     public ReplicaTableSynchronizer(DataSource primaryDataSource, FractalProperties properties) {
         this.primaryTemplate = new NamedParameterJdbcTemplate(primaryDataSource);
+        this.rebalancerProps = properties != null && properties.getRebalancer() != null
+                ? properties.getRebalancer()
+                : new FractalProperties.RebalancerProperties();
 
-        if (properties.getShards() != null) {
+        if (properties != null && properties.getShards() != null) {
             properties.getShards().forEach((name, dbProps) -> {
                 HikariConfig config = new HikariConfig();
                 config.setJdbcUrl(dbProps.getJdbcUrl());
@@ -37,7 +41,12 @@ public class ReplicaTableSynchronizer {
     }
 
     public ReplicaTableSynchronizer(DataSource primaryDataSource, Map<String, DataSource> shardDataSources) {
+        this(primaryDataSource, shardDataSources, new FractalProperties.RebalancerProperties());
+    }
+
+    public ReplicaTableSynchronizer(DataSource primaryDataSource, Map<String, DataSource> shardDataSources, FractalProperties.RebalancerProperties rebalancerProps) {
         this.primaryTemplate = new NamedParameterJdbcTemplate(primaryDataSource);
+        this.rebalancerProps = rebalancerProps != null ? rebalancerProps : new FractalProperties.RebalancerProperties();
         if (shardDataSources != null) {
             shardDataSources.forEach((name, ds) ->
                     this.shardTemplates.put(name, new NamedParameterJdbcTemplate(ds))
@@ -139,7 +148,8 @@ public class ReplicaTableSynchronizer {
 
             String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", tableName, columns, placeholders);
 
-            int batchSize = 500;
+            int columnCount = firstRow.keySet().size();
+            int batchSize = rebalancerProps.calculateBatchSize(columnCount);
             for (int i = 0; i < rows.size(); i += batchSize) {
                 List<Map<String, Object>> chunk = rows.subList(i, Math.min(i + batchSize, rows.size()));
                 MapSqlParameterSource[] batchArgs = chunk.stream()
