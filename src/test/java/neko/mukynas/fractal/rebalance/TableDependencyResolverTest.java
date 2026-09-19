@@ -102,4 +102,37 @@ class TableDependencyResolverTest {
         assertThat(commentsPlan.deleteSql())
                 .isEqualTo("DELETE FROM comments WHERE task_id IN (SELECT id FROM tasks WHERE project_id IN (SELECT id FROM projects WHERE user_id = :userId))");
     }
+
+    @Test
+    void shouldDiscoverAllDatabaseTablesExcludingFractalAndExcludes() {
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("CREATE TABLE audit_logs (id VARCHAR(255) PRIMARY KEY, action VARCHAR(255))");
+        jdbc.execute("CREATE TABLE fractal_shard_topology (shard_id VARCHAR(50) PRIMARY KEY)");
+        jdbc.execute("CREATE TABLE fractal_locks (lock_name VARCHAR(50) PRIMARY KEY)");
+        jdbc.execute("CREATE TABLE fractal_tenant_migrations (id BIGINT PRIMARY KEY)");
+
+        List<String> allTables = resolver.discoverAllDatabaseTables(List.of("audit_logs"));
+        assertThat(allTables).contains("users", "projects", "tasks", "comments");
+        assertThat(allTables).doesNotContain("audit_logs", "fractal_shard_topology", "fractal_locks", "fractal_tenant_migrations");
+    }
+
+    @Test
+    void shouldDiscoverShardedTablesWithShardAll() {
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("CREATE TABLE independent_table (id VARCHAR(255) PRIMARY KEY, data VARCHAR(255))");
+
+        List<String> sharded = resolver.discoverShardedTables("users", null, null, true);
+        assertThat(sharded.get(0)).isEqualTo("users");
+        assertThat(sharded).contains("users", "projects", "tasks", "comments", "independent_table");
+    }
+
+    @Test
+    void shouldResolveMigrationPlansWithShardAll() {
+        JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+        jdbc.execute("CREATE TABLE notifications (user_id VARCHAR(255) PRIMARY KEY, msg VARCHAR(255))");
+
+        List<TableMigrationPlan> plans = resolver.resolveMigrationPlans("users", "id", null, null, true);
+        assertThat(plans).anyMatch(p -> p.tableName().equals("users"));
+        assertThat(plans).anyMatch(p -> p.tableName().equals("notifications"));
+    }
 }

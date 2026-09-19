@@ -53,7 +53,8 @@ public class RebalanceEngine {
                 props.getRootTable(),
                 props.getRootIdColumn(),
                 props.getShardedTables(),
-                props.getExcludeTables()
+                props.getExcludeTables(),
+                props.isShardAll()
         );
 
         // L'ordine per le DELETE è inverso all'ordine di INSERT (figli prima dei padri)

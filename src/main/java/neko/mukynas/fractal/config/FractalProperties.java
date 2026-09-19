@@ -36,6 +36,7 @@ public class FractalProperties {
 
     public static class RebalancerProperties {
         private boolean enabled = false;
+        private boolean shardAll = false;
         private String rootTable;
         private String rootIdColumn;
         private String statusColumn;
@@ -61,6 +62,14 @@ public class FractalProperties {
 
         public void setLockRefreshInterval(Duration lockRefreshInterval) {
             this.lockRefreshInterval = lockRefreshInterval;
+        }
+
+        public boolean isShardAll() {
+            return shardAll;
+        }
+
+        public void setShardAll(boolean shardAll) {
+            this.shardAll = shardAll;
         }
 
         public List<String> getExcludeTables() {

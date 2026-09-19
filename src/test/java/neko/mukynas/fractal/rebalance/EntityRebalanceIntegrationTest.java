@@ -69,6 +69,10 @@ class EntityRebalanceIntegrationTest {
             CREATE TABLE tasks (id VARCHAR(50) PRIMARY KEY, title VARCHAR(100), project_id VARCHAR(50));
         """;
 
+        new JdbcTemplate(primaryDs).execute("DROP ALL OBJECTS");
+        shard1Jdbc.execute("DROP ALL OBJECTS");
+        shard2Jdbc.execute("DROP ALL OBJECTS");
+
         new JdbcTemplate(primaryDs).execute(schema);
         shard1Jdbc.execute(schema);
         shard2Jdbc.execute(schema);
@@ -141,6 +145,69 @@ class EntityRebalanceIntegrationTest {
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-42'", Integer.class));
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE org_id = 'org-42'", Integer.class));
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE project_id = 'proj-1'", Integer.class));
+    }
+
+    @Test
+    void shouldRebalanceAllTablesWhenShardAllIsTrue() {
+        String dropSql = "DROP TABLE IF EXISTS tasks; DROP TABLE IF EXISTS projects; DROP TABLE IF EXISTS organizations; DROP TABLE IF EXISTS notes;";
+        new JdbcTemplate(primaryDs).execute(dropSql);
+        shard1Jdbc.execute(dropSql);
+        shard2Jdbc.execute(dropSql);
+
+        String schemaWithFks = """
+            CREATE TABLE organizations (org_id VARCHAR(50) PRIMARY KEY, name VARCHAR(100), sync_status VARCHAR(20));
+            CREATE TABLE projects (id VARCHAR(50) PRIMARY KEY, name VARCHAR(100), org_id VARCHAR(50), FOREIGN KEY (org_id) REFERENCES organizations(org_id));
+            CREATE TABLE tasks (id VARCHAR(50) PRIMARY KEY, title VARCHAR(100), project_id VARCHAR(50), FOREIGN KEY (project_id) REFERENCES projects(id));
+            CREATE TABLE notes (id VARCHAR(50) PRIMARY KEY, content VARCHAR(100), org_id VARCHAR(50), FOREIGN KEY (org_id) REFERENCES organizations(org_id));
+        """;
+        new JdbcTemplate(primaryDs).execute(schemaWithFks);
+        shard1Jdbc.execute(schemaWithFks);
+        shard2Jdbc.execute(schemaWithFks);
+
+        shard1Jdbc.update("INSERT INTO organizations (org_id, name, sync_status) VALUES ('org-99', 'Global Corp', 'ACTIVE')");
+        shard1Jdbc.update("INSERT INTO projects (id, name, org_id) VALUES ('proj-99', 'Project 99', 'org-99')");
+        shard1Jdbc.update("INSERT INTO tasks (id, title, project_id) VALUES ('task-99', 'Task 99', 'proj-99')");
+        shard1Jdbc.update("INSERT INTO notes (id, content, org_id) VALUES ('note-1', 'Important note', 'org-99')");
+
+        TableDependencyResolver dependencyResolver = new TableDependencyResolver(primaryDs);
+
+        FractalProperties properties = new FractalProperties();
+        properties.getRebalancer().setRootTable("organizations");
+        properties.getRebalancer().setRootIdColumn("org_id");
+        properties.getRebalancer().setStatusColumn("sync_status");
+        properties.getRebalancer().setShardAll(true);
+
+        FractalProperties.DataSourceProperties shard1Props = new FractalProperties.DataSourceProperties();
+        shard1Props.setJdbcUrl("jdbc:h2:mem:entity_rebal_shard1;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
+        shard1Props.setUsername("sa");
+        shard1Props.setPassword("");
+
+        FractalProperties.DataSourceProperties shard2Props = new FractalProperties.DataSourceProperties();
+        shard2Props.setJdbcUrl("jdbc:h2:mem:entity_rebal_shard2;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
+        shard2Props.setUsername("sa");
+        shard2Props.setPassword("");
+
+        properties.setShards(Map.of("shard-1", shard1Props, "shard-2", shard2Props));
+
+        TopologyManager topologyManager = new TopologyManager(primaryDs);
+        topologyManager.initializeSchema();
+
+        RebalanceEngine engine = new RebalanceEngine(primaryDs, dependencyResolver, topologyManager, properties);
+
+        MigrationDeltaCalculator.MigrationAction action =
+                new MigrationDeltaCalculator.MigrationAction("org-99", "shard-1", "shard-2");
+
+        engine.executeMigration(List.of(action));
+
+        assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-99'", Integer.class));
+        assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE org_id = 'org-99'", Integer.class));
+        assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE project_id = 'proj-99'", Integer.class));
+        assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM notes WHERE org_id = 'org-99'", Integer.class));
+
+        assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-99'", Integer.class));
+        assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE org_id = 'org-99'", Integer.class));
+        assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE project_id = 'proj-99'", Integer.class));
+        assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM notes WHERE org_id = 'org-99'", Integer.class));
     }
 
     private HikariDataSource createDataSource(String url) {

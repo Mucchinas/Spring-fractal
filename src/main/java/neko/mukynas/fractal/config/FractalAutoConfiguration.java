@@ -115,6 +115,9 @@ public class FractalAutoConfiguration {
     public TableDependencyResolver tableDependencyResolver(FractalProperties properties,
                                                            EntityTableMetadataResolver entityMetadataResolver) {
         DataSource primary = buildDataSource(properties.getPrimary());
+        if (properties.getRebalancer().isShardAll()) {
+            return new TableDependencyResolver(primary);
+        }
         EntityMetadataResult entityResult = null;
         try {
             entityResult = entityMetadataResolver.resolve();
@@ -145,31 +148,36 @@ public class FractalAutoConfiguration {
                                                      EntityTableMetadataResolver entityMetadataResolver) {
         return args -> {
             if (properties.getRebalancer().isEnabled()) {
-                // Infer root-table, root-id-column, and sharded-tables from entities if not explicitly configured in YAML
-                try {
-                    EntityMetadataResult entityResult = entityMetadataResolver.resolve();
-                    if (entityResult != null && entityResult.rootTable() != null) {
-                        if (properties.getRebalancer().getRootTable() == null) {
-                            properties.getRebalancer().setRootTable(entityResult.rootTable());
+                if (properties.getRebalancer().isShardAll()) {
+                    List<String> allTables = dependencyResolver.discoverAllDatabaseTables(properties.getRebalancer().getExcludeTables());
+                    properties.getRebalancer().setShardedTables(allTables);
+                } else {
+                    // Infer root-table, root-id-column, and sharded-tables from entities if not explicitly configured in YAML
+                    try {
+                        EntityMetadataResult entityResult = entityMetadataResolver.resolve();
+                        if (entityResult != null && entityResult.rootTable() != null) {
+                            if (properties.getRebalancer().getRootTable() == null) {
+                                properties.getRebalancer().setRootTable(entityResult.rootTable());
+                            }
+                            if (properties.getRebalancer().getRootIdColumn() == null) {
+                                properties.getRebalancer().setRootIdColumn(entityResult.rootIdColumn());
+                            }
+                            if (properties.getRebalancer().getStatusColumn() == null && entityResult.statusColumn() != null) {
+                                properties.getRebalancer().setStatusColumn(entityResult.statusColumn());
+                            }
+                            if (entityResult.migratingValue() != null && !entityResult.migratingValue().isBlank()) {
+                                properties.getRebalancer().setMigratingValue(entityResult.migratingValue());
+                            }
+                            if (entityResult.activeValue() != null && !entityResult.activeValue().isBlank()) {
+                                properties.getRebalancer().setActiveValue(entityResult.activeValue());
+                            }
+                            if (properties.getRebalancer().getShardedTables() == null || properties.getRebalancer().getShardedTables().isEmpty()) {
+                                properties.getRebalancer().setShardedTables(entityResult.shardedTables());
+                            }
                         }
-                        if (properties.getRebalancer().getRootIdColumn() == null) {
-                            properties.getRebalancer().setRootIdColumn(entityResult.rootIdColumn());
-                        }
-                        if (properties.getRebalancer().getStatusColumn() == null && entityResult.statusColumn() != null) {
-                            properties.getRebalancer().setStatusColumn(entityResult.statusColumn());
-                        }
-                        if (entityResult.migratingValue() != null && !entityResult.migratingValue().isBlank()) {
-                            properties.getRebalancer().setMigratingValue(entityResult.migratingValue());
-                        }
-                        if (entityResult.activeValue() != null && !entityResult.activeValue().isBlank()) {
-                            properties.getRebalancer().setActiveValue(entityResult.activeValue());
-                        }
-                        if (properties.getRebalancer().getShardedTables() == null || properties.getRebalancer().getShardedTables().isEmpty()) {
-                            properties.getRebalancer().setShardedTables(entityResult.shardedTables());
-                        }
+                    } catch (Exception e) {
+                        System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
                     }
-                } catch (Exception e) {
-                    System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
                 }
 
                 // 1. Crea le tabelle se non esistono

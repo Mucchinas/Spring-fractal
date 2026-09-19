@@ -65,10 +65,75 @@ public class TableDependencyResolver {
     }
 
     /**
+     * Discovers all user tables in the database catalog (excluding system schemas and Fractal metadata tables),
+     * filtering out tables in excludeTables.
+     */
+    public List<String> discoverAllDatabaseTables(List<String> excludeTables) {
+        if (primaryJdbcTemplate == null) {
+            return Collections.emptyList();
+        }
+
+        Set<String> exclusions = new HashSet<>(Arrays.asList(
+                "fractal_shard_topology",
+                "fractal_locks",
+                "fractal_tenant_migrations"
+        ));
+        if (excludeTables != null) {
+            for (String ex : excludeTables) {
+                if (ex != null) exclusions.add(ex.toLowerCase());
+            }
+        }
+
+        String sql = """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE (table_type = 'BASE TABLE' OR table_type = 'TABLE')
+              AND LOWER(table_schema) NOT IN ('information_schema', 'pg_catalog', 'sys', 'performance_schema', 'mysql')
+        """;
+
+        List<String> tables = new ArrayList<>();
+        try {
+            primaryJdbcTemplate.query(sql, rs -> {
+                String name = rs.getString("table_name");
+                if (name != null) {
+                    String lower = name.toLowerCase();
+                    if (!exclusions.contains(lower) && !tables.contains(lower)) {
+                        tables.add(lower);
+                    }
+                }
+            });
+        } catch (Exception e) {
+            System.err.println("FRACTAL: Error discovering all tables from information_schema: " + e.getMessage());
+        }
+        return tables;
+    }
+
+    /**
      * Auto-discovers all sharded tables starting from rootTable by tracing foreign keys.
      * If explicitTables is provided and non-empty, it is used instead of auto-discovery.
      */
     public List<String> discoverShardedTables(String rootTable, List<String> explicitTables, List<String> excludeTables) {
+        return discoverShardedTables(rootTable, explicitTables, excludeTables, false);
+    }
+
+    /**
+     * Discovers sharded tables. If shardAll is true, includes all database tables except exclusions.
+     */
+    public List<String> discoverShardedTables(String rootTable, List<String> explicitTables, List<String> excludeTables, boolean shardAll) {
+        if (shardAll) {
+            List<String> allTables = discoverAllDatabaseTables(excludeTables);
+            if (rootTable != null && !rootTable.isBlank()) {
+                String normRoot = rootTable.toLowerCase();
+                if (allTables.contains(normRoot)) {
+                    allTables.remove(normRoot);
+                    allTables.add(0, normRoot);
+                } else {
+                    allTables.add(0, normRoot);
+                }
+            }
+            return allTables;
+        }
+
         if (rootTable == null || rootTable.isBlank()) {
             return explicitTables != null ? explicitTables : Collections.emptyList();
         }
@@ -189,6 +254,18 @@ public class TableDependencyResolver {
                                                          String rootIdColumn,
                                                          List<String> explicitTables,
                                                          List<String> excludeTables) {
+        return resolveMigrationPlans(rootTable, rootIdColumn, explicitTables, excludeTables, false);
+    }
+
+    /**
+     * Builds migration plans (SELECT and DELETE queries with foreign key hopping)
+     * for all sharded tables in topological insert order, supporting shardAll flag.
+     */
+    public List<TableMigrationPlan> resolveMigrationPlans(String rootTable,
+                                                         String rootIdColumn,
+                                                         List<String> explicitTables,
+                                                         List<String> excludeTables,
+                                                         boolean shardAll) {
         if (rootTable == null || rootTable.isBlank()) {
             return Collections.emptyList();
         }
@@ -196,7 +273,7 @@ public class TableDependencyResolver {
         String normRoot = rootTable.toLowerCase();
         String normRootId = rootIdColumn != null ? rootIdColumn.toLowerCase() : "id";
 
-        List<String> tables = discoverShardedTables(normRoot, explicitTables, excludeTables);
+        List<String> tables = discoverShardedTables(normRoot, explicitTables, excludeTables, shardAll);
         List<String> orderedTables = resolveInsertOrder(tables);
         List<TableForeignKey> allFks = loadForeignKeys();
 

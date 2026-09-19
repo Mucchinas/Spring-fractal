@@ -303,6 +303,7 @@ When domain entity annotations are not used, `TableDependencyResolver` (`neko.mu
 4. **Topological Ordering**: Executes **Kahn's Algorithm (Topological Sort)** to produce:
    - **Insert Order**: Root/parent tables first, followed by child tables down to leaves.
    - **Delete Order**: The exact reverse of the insert order (leaf child tables first, root tables last).
+5. **Catalog-Wide Sharding (`shard-all`)**: When `fractal.sharding.rebalancer.shard-all: true`, the rebalancer automatically discovers and shards all base user tables in the database schema, completely ignoring `@ShardedEntity` annotations. System schemas (`pg_catalog`, `information_schema`, `sys`, etc.) and internal Fractal tables are filtered out automatically, and tables defined in `exclude-tables` are excluded. Topological migration order and foreign key hopping paths are computed from the database catalog.
 
 ### Rebalance Execution Lifecycle & Idempotent Crash Recovery
 
@@ -371,6 +372,7 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.shards.<name>.username` | `String` | - | Database username for physical shard `<name>`. |
 | `fractal.sharding.shards.<name>.password` | `String` | - | Database password for physical shard `<name>`. |
 | `fractal.sharding.rebalancer.enabled` | `boolean` | `false` | Enables the automatic migration listener on startup. |
+| `fractal.sharding.rebalancer.shard-all` | `boolean` | `false` | When `true`, automatically shards all database tables (catalog discovery) except excluded tables, ignoring `@ShardedEntity`. |
 | `fractal.sharding.rebalancer.lock-timeout` | `Duration` | `15m` | Maximum lock expiration duration before an unreleased lock is considered dead and eligible for atomic takeover. |
 | `fractal.sharding.rebalancer.lock-refresh-interval` | `Duration` | `1m` | Periodic heartbeat interval for renewing `locked_at` during an active rebalance migration. |
 | `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
@@ -410,6 +412,7 @@ fractal:
         password: secretpassword
     rebalancer:
       enabled: false
+      shard-all: false            # shard all DB tables except exclude-tables (ignores @ShardedEntity)
       lock-timeout: 15m           # lock expiration TTL for crash takeover (default: 15m)
       lock-refresh-interval: 1m   # periodic heartbeat to renew lock (default: 1m)
       # Zero-Config: When using @ShardedEntity(root = true), @ShardedKey, and @ShardedStatus,
