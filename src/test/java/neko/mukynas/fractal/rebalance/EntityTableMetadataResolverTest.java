@@ -6,6 +6,7 @@ import jakarta.persistence.JoinColumn;
 import jakarta.persistence.Table;
 import neko.mukynas.fractal.annotation.ShardedEntity;
 import neko.mukynas.fractal.annotation.ShardedKey;
+import neko.mukynas.fractal.annotation.ShardedStatus;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -209,5 +210,88 @@ class EntityTableMetadataResolverTest {
                 resolver.resolveFromClasses(List.of(Organization.class, MissingTargetEntityChild.class))
         );
         assertTrue(ex.getMessage().contains("Cannot determine target parent entity"));
+    }
+
+    // 9. Root entity with @ShardedStatus
+    @ShardedEntity(root = true)
+    @Table(name = "accounts")
+    static class AccountWithStatus {
+        @Id
+        private String id;
+
+        @ShardedStatus
+        @Column(name = "sync_status")
+        private String syncStatus;
+    }
+
+    @Test
+    void shouldResolveShardedStatusFromRootEntity() {
+        EntityMetadataResult result = resolver.resolveFromClasses(List.of(AccountWithStatus.class));
+
+        assertNotNull(result);
+        assertEquals("accounts", result.rootTable());
+        assertEquals("id", result.rootIdColumn());
+        assertEquals("sync_status", result.statusColumn());
+        assertNull(result.migratingValue());
+        assertNull(result.activeValue());
+    }
+
+    // 10. Root entity with explicit @ShardedStatus values
+    @ShardedEntity(root = true)
+    static class AccountWithCustomStatusValues {
+        @ShardedKey
+        private String id;
+
+        @ShardedStatus(column = "migration_phase", migratingValue = "MOVING", activeValue = "READY")
+        private String status;
+    }
+
+    @Test
+    void shouldResolveCustomShardedStatusValues() {
+        EntityMetadataResult result = resolver.resolveFromClasses(List.of(AccountWithCustomStatusValues.class));
+
+        assertNotNull(result);
+        assertEquals("migration_phase", result.statusColumn());
+        assertEquals("MOVING", result.migratingValue());
+        assertEquals("READY", result.activeValue());
+    }
+
+    // 11. Error: multiple @ShardedStatus on root entity
+    @ShardedEntity(root = true)
+    static class DuplicateStatusEntity {
+        @ShardedKey
+        private String id;
+
+        @ShardedStatus
+        private String status1;
+
+        @ShardedStatus
+        private String status2;
+    }
+
+    @Test
+    void shouldFailWhenMultipleShardedStatusOnRoot() {
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                resolver.resolveFromClasses(List.of(DuplicateStatusEntity.class))
+        );
+        assertTrue(ex.getMessage().contains("Multiple @ShardedStatus annotations found"));
+    }
+
+    // 12. Error: @ShardedStatus on non-root entity
+    @ShardedEntity
+    static class NonRootWithStatus {
+        @ShardedKey(targetEntity = Organization.class, column = "org_id")
+        private String orgId;
+
+        @ShardedStatus
+        private String status;
+    }
+
+    @Test
+    void shouldFailWhenShardedStatusOnNonRoot() {
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                resolver.resolveFromClasses(List.of(Organization.class, NonRootWithStatus.class))
+        );
+        assertTrue(ex.getMessage().contains("is only permitted on the root entity"));
     }
 }

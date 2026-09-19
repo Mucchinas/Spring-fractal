@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import neko.mukynas.fractal.annotation.ShardedEntity;
 import neko.mukynas.fractal.annotation.ShardedKey;
+import neko.mukynas.fractal.annotation.ShardedStatus;
 import neko.mukynas.fractal.config.FractalProperties;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -31,6 +32,8 @@ class EntityRebalanceIntegrationTest {
         @ShardedKey(column = "org_id")
         private String orgId;
         private String name;
+        @ShardedStatus(column = "sync_status")
+        private String syncStatus;
     }
 
     @ShardedEntity(table = "projects")
@@ -94,6 +97,7 @@ class EntityRebalanceIntegrationTest {
 
         assertEquals("organizations", metadata.rootTable());
         assertEquals("org_id", metadata.rootIdColumn());
+        assertEquals("sync_status", metadata.statusColumn());
         assertEquals(List.of("organizations", "projects", "tasks"), metadata.shardedTables());
 
         // Configure TableDependencyResolver with entity-resolved foreign keys
@@ -102,7 +106,7 @@ class EntityRebalanceIntegrationTest {
         FractalProperties properties = new FractalProperties();
         properties.getRebalancer().setRootTable(metadata.rootTable());
         properties.getRebalancer().setRootIdColumn(metadata.rootIdColumn());
-        properties.getRebalancer().setStatusColumn("sync_status");
+        properties.getRebalancer().setStatusColumn(metadata.statusColumn());
         properties.getRebalancer().setShardedTables(metadata.shardedTables());
 
         FractalProperties.DataSourceProperties shard1Props = new FractalProperties.DataSourceProperties();

@@ -155,6 +155,15 @@ public class FractalAutoConfiguration {
                         if (properties.getRebalancer().getRootIdColumn() == null) {
                             properties.getRebalancer().setRootIdColumn(entityResult.rootIdColumn());
                         }
+                        if (properties.getRebalancer().getStatusColumn() == null && entityResult.statusColumn() != null) {
+                            properties.getRebalancer().setStatusColumn(entityResult.statusColumn());
+                        }
+                        if (entityResult.migratingValue() != null && !entityResult.migratingValue().isBlank()) {
+                            properties.getRebalancer().setMigratingValue(entityResult.migratingValue());
+                        }
+                        if (entityResult.activeValue() != null && !entityResult.activeValue().isBlank()) {
+                            properties.getRebalancer().setActiveValue(entityResult.activeValue());
+                        }
                         if (properties.getRebalancer().getShardedTables() == null || properties.getRebalancer().getShardedTables().isEmpty()) {
                             properties.getRebalancer().setShardedTables(entityResult.shardedTables());
                         }

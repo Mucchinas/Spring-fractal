@@ -15,7 +15,7 @@ Fractal is an automated horizontal database sharding starter for Spring Boot 3 a
 - [Automated Rebalancer and Migration Subsystem](#automated-rebalancer-and-migration-subsystem)
   - [Topology Management, Distributed Locking, and Heartbeat](#topology-management-distributed-locking-and-heartbeat)
   - [Delta Calculation](#delta-calculation)
-  - [Domain Entity Auto-Discovery (@ShardedEntity & @ShardedKey)](#domain-entity-auto-discovery-shardedentity--shardedkey)
+  - [Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, & @ShardedStatus)](#domain-entity-auto-discovery-shardedentity-shardedkey--shardedstatus)
   - [Database Catalog Dependency Resolution](#database-catalog-dependency-resolution)
   - [Rebalance Execution Lifecycle & Idempotent Crash Recovery](#rebalance-execution-lifecycle--idempotent-crash-recovery)
 - [Configuration Reference](#configuration-reference)
@@ -227,20 +227,25 @@ Fractal includes a background data rebalancing mechanism designed to handle clus
 
 It scans all entity identifiers in `rootTable` and filters records where `oldRouter.routeNode(id)` differs from `newRouter.routeNode(id)`, yielding an execution plan of `MigrationAction(id, sourceShard, targetShard)` records.
 
-### Domain Entity Auto-Discovery (@ShardedEntity & @ShardedKey)
+### Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, & @ShardedStatus)
 
-Fractal provides a declarative domain-driven discovery engine via `EntityTableMetadataResolver` (`neko.mukynas.fractal.rebalance.EntityTableMetadataResolver`), using `@ShardedEntity` and `@ShardedKey`:
+Fractal provides a declarative domain-driven discovery engine via `EntityTableMetadataResolver` (`neko.mukynas.fractal.rebalance.EntityTableMetadataResolver`), using `@ShardedEntity`, `@ShardedKey`, and `@ShardedStatus`:
 
 1. **Root Partition Anchor**: Exactly one domain entity is marked with `@ShardedEntity(root = true)`. The key field on this entity (annotated with `@ShardedKey` or JPA `@Id`) serves as the cluster partition key (`rootTable` and `rootIdColumn`).
 2. **Foreign Key Hopping**: Descendant entities annotated with `@ShardedEntity` declare a `@ShardedKey` on the field or method that hops back towards the root:
    - **Entity References**: When the field references another `@ShardedEntity` (e.g. `@ManyToOne Organization organization`), the target entity is inferred automatically.
    - **Scalar Foreign Keys**: For raw ID columns (e.g. `UUID projectId`), the target entity is specified explicitly via `@ShardedKey(targetEntity = Project.class, column = "project_id")`.
-3. **Physical DB Foreign Key Independence**: Auto-discovery operates directly on Java domain models. This enables full topological migration planning even on high-throughput database clusters where physical database foreign key constraints are omitted for performance.
-4. **Graph Validation on Startup**:
+3. **Migration Status Column Auto-Discovery (@ShardedStatus)**:
+   The root entity can designate its tenant migration status column using `@ShardedStatus` (e.g. on `syncStatus` or `status`):
+   - The column name is inferred automatically from JPA `@Column(name = "...")`, field name in snake_case, or explicit `@ShardedStatus(column = "...")`.
+   - Optionally customizes status string values directly on the annotation via `migratingValue` and `activeValue` (e.g. `@ShardedStatus(migratingValue = "MIGRATING", activeValue = "ACTIVE")`).
+   - Validated at startup: `@ShardedStatus` is only permitted on the root entity, and duplicate declarations fail fast.
+4. **Physical DB Foreign Key Independence**: Auto-discovery operates directly on Java domain models. This enables full topological migration planning even on high-throughput database clusters where physical database foreign key constraints are omitted for performance.
+5. **Graph Validation on Startup**:
    - Ensures exactly one root entity exists.
    - Verifies acyclicity (cycle detection).
    - Validates that every descendant entity can reach the root entity via hops.
-5. **Zero-Config Rebalancing**: If `@ShardedEntity` classes are present, `root-table`, `root-id-column`, and `sharded-tables` in `application.yml` are completely optional.
+6. **Zero-Config Rebalancing**: When `@ShardedEntity`, `@ShardedKey`, and `@ShardedStatus` are defined on your domain models, **none of `root-table`, `root-id-column`, `status-column`, or `sharded-tables` need to be configured in `application.yml`**! Fractal infers the entire cluster schema and migration topology automatically.
 
 #### Domain Model Example:
 
@@ -252,7 +257,13 @@ public class Organization {
     @Id
     @ShardedKey
     private String id;
+
     private String name;
+
+    // Discovered automatically: marks tenant as MIGRATING/ACTIVE during rebalancing
+    @ShardedStatus
+    @Column(name = "sync_status")
+    private String syncStatus;
 }
 
 @Entity
@@ -364,9 +375,9 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.rebalancer.lock-refresh-interval` | `Duration` | `1m` | Periodic heartbeat interval for renewing `locked_at` during an active rebalance migration. |
 | `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
 | `fractal.sharding.rebalancer.root-id-column` | `String` | - | Partition column name (e.g., `org_id`). Inferred from root `@ShardedKey` or `@Id` if omitted. |
-| `fractal.sharding.rebalancer.status-column` | `String` | - | Column on `rootTable` indicating migration state. |
-| `fractal.sharding.rebalancer.migrating-value` | `String` | `MIGRATING` | State string set during an in-flight migration. |
-| `fractal.sharding.rebalancer.active-value` | `String` | `ACTIVE` | State string when tenant is available. |
+| `fractal.sharding.rebalancer.status-column` | `String` | - | Column on `rootTable` indicating migration state. Inferred from root `@ShardedStatus` if omitted. |
+| `fractal.sharding.rebalancer.migrating-value` | `String` | `MIGRATING` | State string set during an in-flight migration. Inferred from `@ShardedStatus(migratingValue = ...)` if omitted. |
+| `fractal.sharding.rebalancer.active-value` | `String` | `ACTIVE` | State string when tenant is available. Inferred from `@ShardedStatus(activeValue = ...)` if omitted. |
 | `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedEntity` domain models or foreign key graph. |
 | `fractal.sharding.rebalancer.exclude-tables` | `List<String>` | `null` | Optional list of tables to exclude from auto-discovery. |
 
@@ -401,16 +412,17 @@ fractal:
       enabled: false
       lock-timeout: 15m           # lock expiration TTL for crash takeover (default: 15m)
       lock-refresh-interval: 1m   # periodic heartbeat to renew lock (default: 1m)
-      root-table: organizations
-      root-id-column: org_id
-      status-column: sync_status
-      migrating-value: MIGRATING
-      active-value: ACTIVE
-      # Optional: if sharded-tables is omitted, descendant tables are auto-discovered via foreign keys
+      # Zero-Config: When using @ShardedEntity(root = true), @ShardedKey, and @ShardedStatus,
+      # root-table, root-id-column, status-column, and sharded-tables are 100% auto-discovered!
+      # root-table: organizations
+      # root-id-column: org_id
+      # status-column: sync_status
+      # migrating-value: MIGRATING
+      # active-value: ACTIVE
       # sharded-tables:
       #   - organizations
       #   - projects
-      #   - audit_logs
+      #   - tasks
       # Optional: exclude specific tables from auto-discovery
       exclude-tables:
         - flyway_schema_history
@@ -714,7 +726,7 @@ Execute the unit and integration test suite:
 mvn clean test
 ```
 
-The test suite covers 38 automated tests across 12 test suites:
+The test suite covers 42 automated tests across 12 test suites:
 - `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes on the 64-bit ring.
 - `RoutingIntegrationTest`: Verifies dynamic shard selection, primary fallback, and SpEL resolution using in-memory H2 databases.
 - `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens (`sub` claim) in `SecurityContextHolder`.
@@ -722,11 +734,12 @@ The test suite covers 38 automated tests across 12 test suites:
 - `JwtSecurityKeyExtractorTest`: Validates custom claim extraction, fallback logic, string/numeric/UUID claim conversions, and unauthenticated state handling.
 - `ShardingAspectMigrationLockTest`: Asserts that `TenantMigratingException` is thrown when accessing a tenant currently flagged as migrating.
 - `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution (`users` -> `projects` -> `tasks`), Kahn's topological sort for insert/delete ordering, join query synthesis, and table exclusion.
-- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity` and `@ShardedKey`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, cycle detection, reachability checks, and single-root enforcement.
-- `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans.
+- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity`, `@ShardedKey`, and `@ShardedStatus`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
+- `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans and `@ShardedStatus`.
 - `RebalanceEngineTest`: Validates end-to-end tenant migration, row copying across shards using multi-hop plans, and reverse-order row pruning.
 - `TopologyManagerLockTest`: Verifies distributed lock acquisition, mutual exclusion, expired lock takeover via configurable TTL, periodic heartbeat renewal, graceful shutdown lock release, automatic schema initialization via `InitializingBean`, and idempotent ANSI shard registration.
 - `RebalanceEngineIdempotencyTest`: Asserts idempotent crash recovery across migration phases, resumption from aborted `COPYING` state (purging partial target data and recopying), resumption from aborted `PRUNING` state (safe source pruning without duplicate inserts), and safe repeated execution without side effects.
+
 
 
 

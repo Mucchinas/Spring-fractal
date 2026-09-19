@@ -2,6 +2,7 @@ package neko.mukynas.fractal.rebalance;
 
 import neko.mukynas.fractal.annotation.ShardedEntity;
 import neko.mukynas.fractal.annotation.ShardedKey;
+import neko.mukynas.fractal.annotation.ShardedStatus;
 import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
 import org.springframework.context.ApplicationContext;
@@ -129,6 +130,14 @@ public class EntityTableMetadataResolver {
             hopGraph.put(childTable, parentTable);
         }
 
+        // Validate that no descendant entity declares @ShardedStatus
+        for (Class<?> clazz : shardedClasses) {
+            if (!clazz.equals(rootClass) && hasShardedStatusAnnotation(clazz)) {
+                throw new IllegalStateException("Entity '" + clazz.getName()
+                        + "' declares @ShardedStatus but is not the root @ShardedEntity. @ShardedStatus is only permitted on the root entity.");
+            }
+        }
+
         // Validate graph connectivity: each child table must reach rootTable
         for (Class<?> clazz : shardedClasses) {
             if (clazz.equals(rootClass)) {
@@ -148,10 +157,15 @@ public class EntityTableMetadataResolver {
             }
         }
 
+        StatusMemberInfo statusInfo = resolveStatusMember(rootClass);
+        String statusColumn = statusInfo != null ? statusInfo.columnName() : null;
+        String migratingValue = statusInfo != null ? statusInfo.migratingValue() : null;
+        String activeValue = statusInfo != null ? statusInfo.activeValue() : null;
+
         // Compute insert order (Kahn's topological sort)
         List<String> insertOrder = computeTopologicalOrder(rootTable, tableNames.values(), foreignKeys);
 
-        return new EntityMetadataResult(rootTable, rootIdColumn, insertOrder, foreignKeys);
+        return new EntityMetadataResult(rootTable, rootIdColumn, statusColumn, migratingValue, activeValue, insertOrder, foreignKeys);
     }
 
     private List<String> computeTopologicalOrder(String rootTable, Collection<String> allTables, List<TableForeignKey> fks) {
@@ -408,5 +422,50 @@ public class EntityTableMetadataResolver {
             Class<?> targetEntity,
             String referencedColumn,
             Class<?> type
+    ) {}
+
+    private boolean hasShardedStatusAnnotation(Class<?> clazz) {
+        return resolveStatusMember(clazz) != null;
+    }
+
+    private StatusMemberInfo resolveStatusMember(Class<?> clazz) {
+        Class<?> current = clazz;
+        StatusMemberInfo found = null;
+        while (current != null && !current.equals(Object.class)) {
+            for (Field field : current.getDeclaredFields()) {
+                if (field.isAnnotationPresent(ShardedStatus.class)) {
+                    if (found != null) {
+                        throw new IllegalStateException("Multiple @ShardedStatus annotations found on entity '"
+                                + clazz.getName() + "'. Exactly one status column is supported.");
+                    }
+                    ShardedStatus status = field.getAnnotation(ShardedStatus.class);
+                    String col = resolveColumnFromMember(field, status.column());
+                    String migrating = status.migratingValue().isBlank() ? null : status.migratingValue();
+                    String active = status.activeValue().isBlank() ? null : status.activeValue();
+                    found = new StatusMemberInfo(col, migrating, active);
+                }
+            }
+            for (Method method : current.getDeclaredMethods()) {
+                if (method.isAnnotationPresent(ShardedStatus.class)) {
+                    if (found != null) {
+                        throw new IllegalStateException("Multiple @ShardedStatus annotations found on entity '"
+                                + clazz.getName() + "'. Exactly one status column is supported.");
+                    }
+                    ShardedStatus status = method.getAnnotation(ShardedStatus.class);
+                    String col = resolveColumnFromMember(method, status.column());
+                    String migrating = status.migratingValue().isBlank() ? null : status.migratingValue();
+                    String active = status.activeValue().isBlank() ? null : status.activeValue();
+                    found = new StatusMemberInfo(col, migrating, active);
+                }
+            }
+            current = current.getSuperclass();
+        }
+        return found;
+    }
+
+    private record StatusMemberInfo(
+            String columnName,
+            String migratingValue,
+            String activeValue
     ) {}
 }
