@@ -11,7 +11,10 @@ import neko.mukynas.fractal.rebalance.MigrationDeltaCalculator;
 import neko.mukynas.fractal.rebalance.RebalanceEngine;
 import neko.mukynas.fractal.rebalance.TableDependencyResolver;
 import neko.mukynas.fractal.rebalance.TopologyManager;
+import neko.mukynas.fractal.rebalance.EntityMetadataResult;
+import neko.mukynas.fractal.rebalance.EntityTableMetadataResolver;
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.context.ApplicationContext;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -99,8 +102,24 @@ public class FractalAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public TableDependencyResolver tableDependencyResolver(FractalProperties properties) {
+    public EntityTableMetadataResolver entityTableMetadataResolver(ApplicationContext applicationContext) {
+        return new EntityTableMetadataResolver(applicationContext);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public TableDependencyResolver tableDependencyResolver(FractalProperties properties,
+                                                           EntityTableMetadataResolver entityMetadataResolver) {
         DataSource primary = buildDataSource(properties.getPrimary());
+        EntityMetadataResult entityResult = null;
+        try {
+            entityResult = entityMetadataResolver.resolve();
+        } catch (Exception e) {
+            System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
+        }
+        if (entityResult != null && !entityResult.foreignKeys().isEmpty()) {
+            return new TableDependencyResolver(primary, entityResult.foreignKeys());
+        }
         return new TableDependencyResolver(primary);
     }
 
@@ -118,9 +137,28 @@ public class FractalAutoConfiguration {
                                                      TableDependencyResolver dependencyResolver,
                                                      RebalanceEngine rebalanceEngine,
                                                      ThreadPoolTaskExecutor fractalRebalanceExecutor,
-                                                     FractalProperties properties) {
+                                                     FractalProperties properties,
+                                                     EntityTableMetadataResolver entityMetadataResolver) {
         return args -> {
             if (properties.getRebalancer().isEnabled()) {
+                // Infer root-table, root-id-column, and sharded-tables from entities if not explicitly configured in YAML
+                try {
+                    EntityMetadataResult entityResult = entityMetadataResolver.resolve();
+                    if (entityResult != null && entityResult.rootTable() != null) {
+                        if (properties.getRebalancer().getRootTable() == null) {
+                            properties.getRebalancer().setRootTable(entityResult.rootTable());
+                        }
+                        if (properties.getRebalancer().getRootIdColumn() == null) {
+                            properties.getRebalancer().setRootIdColumn(entityResult.rootIdColumn());
+                        }
+                        if (properties.getRebalancer().getShardedTables() == null || properties.getRebalancer().getShardedTables().isEmpty()) {
+                            properties.getRebalancer().setShardedTables(entityResult.shardedTables());
+                        }
+                    }
+                } catch (Exception e) {
+                    System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
+                }
+
                 // 1. Crea le tabelle se non esistono
                 topologyManager.initializeSchema();
 

@@ -15,7 +15,8 @@ Fractal is an automated horizontal database sharding starter for Spring Boot 3 a
 - [Automated Rebalancer and Migration Subsystem](#automated-rebalancer-and-migration-subsystem)
   - [Topology Management and Distributed Locking](#topology-management-and-distributed-locking)
   - [Delta Calculation](#delta-calculation)
-  - [Foreign Key Dependency Resolution](#foreign-key-dependency-resolution)
+  - [Domain Entity Auto-Discovery (@ShardedEntity & @ShardedKey)](#domain-entity-auto-discovery-shardedentity--shardedkey)
+  - [Database Catalog Dependency Resolution](#database-catalog-dependency-resolution)
   - [Rebalance Execution Lifecycle](#rebalance-execution-lifecycle)
 - [Configuration Reference](#configuration-reference)
   - [Property Specifications](#property-specifications)
@@ -24,6 +25,7 @@ Fractal is an automated horizontal database sharding starter for Spring Boot 3 a
   - [Maven Dependency](#maven-dependency)
   - [Service-Level Annotation with SpEL](#service-level-annotation-with-spel)
   - [Transparent Routing via Spring Security JWT](#transparent-routing-via-spring-security-jwt)
+  - [Handling Rebalance Migration Lock (TenantMigratingException)](#handling-rebalance-migration-lock-tenantmigratingexception)
   - [Implementing a Custom ShardingKeyExtractor](#implementing-a-custom-shardingkeyextractor)
 - [Technical Considerations and Dialect Constraints](#technical-considerations-and-dialect-constraints)
 - [Building and Testing](#building-and-testing)
@@ -45,14 +47,18 @@ Fractal intercepts business method execution at the service layer to resolve a s
 |                 Spring AOP Proxy (@Sharded Interceptor)                |
 |                                                                       |
 |  1. Extract Sharding Key:                                             |
-|     - Priority A: ShardingKeyExtractor chain (e.g. JWT 'sub' claim)   |
+|     - Priority A: ShardingKeyExtractor chain (e.g. JWT claim)          |
 |     - Priority B: SpEL expression evaluation on method arguments       |
 |                                                                       |
-|  2. ConsistentHashRouter:                                             |
+|  2. Tenant Migration Guard:                                           |
+|     - Check TopologyManager.isTenantMigrating(key)                    |
+|     - Throws TenantMigratingException if migration is in flight       |
+|                                                                       |
+|  3. ConsistentHashRouter:                                             |
 |     - Hash key with MD5 onto 64-bit virtual node ring                 |
 |     - Resolve target shard name (e.g., "shard-1")                     |
 |                                                                       |
-|  3. ShardContextHolder:                                               |
+|  4. ShardContextHolder:                                               |
 |     - Bind shard name to ThreadLocal                                  |
 +-----------------------------------+-+---------------------------------+
                                     |
@@ -191,13 +197,68 @@ Fractal includes a background data rebalancing mechanism designed to handle clus
 
 It scans all entity identifiers in `rootTable` and filters records where `oldRouter.routeNode(id)` differs from `newRouter.routeNode(id)`, yielding an execution plan of `MigrationAction(id, sourceShard, targetShard)` records.
 
-### Foreign Key Dependency Resolution & Auto-Discovery
+### Domain Entity Auto-Discovery (@ShardedEntity & @ShardedKey)
 
-`TableDependencyResolver` (`neko.mukynas.fractal.rebalance.TableDependencyResolver`) introspects database foreign key constraints using ANSI standard `information_schema` tables:
+Fractal provides a declarative domain-driven discovery engine via `EntityTableMetadataResolver` (`neko.mukynas.fractal.rebalance.EntityTableMetadataResolver`), using `@ShardedEntity` and `@ShardedKey`:
 
-1. **Zero-Config Auto-Discovery**: If `sharded-tables` is omitted from configuration, Fractal recursively traces foreign key relationships starting from `rootTable`, automatically identifying all child, grandchild, and descendant tables.
-2. **Exclusion Filtering**: Tables can be excluded from auto-discovery via `exclude-tables`.
-3. **Foreign Key Hopping**: For tables without a direct root foreign key (e.g. `users` -> `projects` -> `tasks`), the resolver generates relational `JOIN` queries for data extraction and cascaded subqueries for pruning.
+1. **Root Partition Anchor**: Exactly one domain entity is marked with `@ShardedEntity(root = true)`. The key field on this entity (annotated with `@ShardedKey` or JPA `@Id`) serves as the cluster partition key (`rootTable` and `rootIdColumn`).
+2. **Foreign Key Hopping**: Descendant entities annotated with `@ShardedEntity` declare a `@ShardedKey` on the field or method that hops back towards the root:
+   - **Entity References**: When the field references another `@ShardedEntity` (e.g. `@ManyToOne Organization organization`), the target entity is inferred automatically.
+   - **Scalar Foreign Keys**: For raw ID columns (e.g. `UUID projectId`), the target entity is specified explicitly via `@ShardedKey(targetEntity = Project.class, column = "project_id")`.
+3. **Physical DB Foreign Key Independence**: Auto-discovery operates directly on Java domain models. This enables full topological migration planning even on high-throughput database clusters where physical database foreign key constraints are omitted for performance.
+4. **Graph Validation on Startup**:
+   - Ensures exactly one root entity exists.
+   - Verifies acyclicity (cycle detection).
+   - Validates that every descendant entity can reach the root entity via hops.
+5. **Zero-Config Rebalancing**: If `@ShardedEntity` classes are present, `root-table`, `root-id-column`, and `sharded-tables` in `application.yml` are completely optional.
+
+#### Domain Model Example:
+
+```java
+@Entity
+@Table(name = "organizations")
+@ShardedEntity(root = true)
+public class Organization {
+    @Id
+    @ShardedKey
+    private String id;
+    private String name;
+}
+
+@Entity
+@Table(name = "projects")
+@ShardedEntity
+public class Project {
+    @Id
+    private UUID id;
+
+    // Hop 1: Inferred target entity from Organization type
+    @ShardedKey
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "org_id")
+    private Organization organization;
+}
+
+@Entity
+@Table(name = "tasks")
+@ShardedEntity
+public class Task {
+    @Id
+    private UUID id;
+
+    // Hop 2: Explicit scalar foreign key pointing to Project
+    @ShardedKey(targetEntity = Project.class, column = "project_id")
+    private UUID projectId;
+}
+```
+
+### Database Catalog Dependency Resolution
+
+When domain entity annotations are not used, `TableDependencyResolver` (`neko.mukynas.fractal.rebalance.TableDependencyResolver`) falls back to introspecting database foreign key constraints using standard ANSI `information_schema` views (`referential_constraints` and `key_column_usage`):
+
+1. **Catalog Auto-Discovery**: If `sharded-tables` is omitted, Fractal recursively traces foreign key relationships starting from `rootTable`.
+2. **Exclusion Filtering**: Tables can be excluded from discovery via `exclude-tables`.
+3. **Foreign Key Hopping**: For tables without a direct root foreign key, the resolver generates relational `JOIN` queries for data extraction and cascaded subqueries for pruning.
 4. **Topological Ordering**: Executes **Kahn's Algorithm (Topological Sort)** to produce:
    - **Insert Order**: Root/parent tables first, followed by child tables down to leaves.
    - **Delete Order**: The exact reverse of the insert order (leaf child tables first, root tables last).
@@ -233,12 +294,12 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.shards.<name>.username` | `String` | - | Database username for physical shard `<name>`. |
 | `fractal.sharding.shards.<name>.password` | `String` | - | Database password for physical shard `<name>`. |
 | `fractal.sharding.rebalancer.enabled` | `boolean` | `false` | Enables the automatic migration listener on startup. |
-| `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `tenants`). |
-| `fractal.sharding.rebalancer.root-id-column` | `String` | - | Partition column name present across tables (e.g., `tenant_id`). |
+| `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
+| `fractal.sharding.rebalancer.root-id-column` | `String` | - | Partition column name (e.g., `org_id`). Inferred from root `@ShardedKey` or `@Id` if omitted. |
 | `fractal.sharding.rebalancer.status-column` | `String` | - | Column on `rootTable` indicating migration state. |
 | `fractal.sharding.rebalancer.migrating-value` | `String` | `MIGRATING` | State string set during an in-flight migration. |
 | `fractal.sharding.rebalancer.active-value` | `String` | `ACTIVE` | State string when tenant is available. |
-| `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. If omitted, discovered automatically from `rootTable`. |
+| `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedEntity` domain models or foreign key graph. |
 | `fractal.sharding.rebalancer.exclude-tables` | `List<String>` | `null` | Optional list of tables to exclude from auto-discovery. |
 
 ### Configuration Example
@@ -248,6 +309,8 @@ fractal:
   sharding:
     enabled: true
     virtual-nodes: 150
+    jwt:
+      claim-name: tenant_id       # optional: claim to extract (default: 'sub')
     primary:
       jdbc-url: jdbc:postgresql://localhost:5432/primary_db
       username: postgres
@@ -272,10 +335,14 @@ fractal:
       status-column: sync_status
       migrating-value: MIGRATING
       active-value: ACTIVE
-      sharded-tables:
-        - organizations
-        - projects
-        - audit_logs
+      # Optional: if sharded-tables is omitted, descendant tables are auto-discovered via foreign keys
+      # sharded-tables:
+      #   - organizations
+      #   - projects
+      #   - audit_logs
+      # Optional: exclude specific tables from auto-discovery
+      exclude-tables:
+        - flyway_schema_history
 ```
 
 ---
@@ -337,17 +404,56 @@ public class OrderService {
 
 ### Transparent Routing via Spring Security JWT
 
-When `spring-boot-starter-oauth2-resource-server` is present on the classpath, `JwtSecurityKeyExtractor` is automatically activated. The router will extract the JWT `sub` (Subject) claim without requiring SpEL expressions on the method:
+When `spring-boot-starter-oauth2-resource-server` is present on the classpath, `JwtSecurityKeyExtractor` is automatically activated.
+
+By default, the router extracts the JWT `sub` (Subject) claim from the authenticated `JwtAuthenticationToken`. You can configure a custom claim (such as `tenant_id`, `org_id`, or `account_id`) via application properties:
+
+```yaml
+fractal:
+  sharding:
+    jwt:
+      claim-name: tenant_id   # extracts 'tenant_id' claim instead of default 'sub'
+```
+
+String, numeric, and UUID claim representations are automatically coerced into the routing key string. Service methods require no SpEL annotations:
 
 ```java
 @Service
 public class UserProfileService {
 
-    // Automatically extracts the JWT 'sub' claim from SecurityContextHolder
+    // Automatically extracts the configured JWT claim from SecurityContextHolder
     @Sharded
     @Transactional(readOnly = true)
     public UserProfile getCurrentUserProfile() {
         return profileRepository.findCurrent();
+    }
+}
+```
+
+### Handling Rebalance Migration Lock (TenantMigratingException)
+
+When a tenant is actively migrating between shards, `ShardingAspect` intercepts service invocations and throws `TenantMigratingException` (`neko.mukynas.fractal.exception.TenantMigratingException`) to prevent dirty writes or split-brain updates while data rows are being moved.
+
+Applications can catch this exception via a Spring `@RestControllerAdvice` and return an HTTP `503 Service Unavailable` or `423 Locked` response with a `Retry-After` header:
+
+```java
+package com.example.web;
+
+import neko.mukynas.fractal.exception.TenantMigratingException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+@RestControllerAdvice
+public class ShardingExceptionHandler {
+
+    @ExceptionHandler(TenantMigratingException.class)
+    public ResponseEntity<String> handleTenantMigrating(TenantMigratingException ex) {
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                .header(HttpHeaders.RETRY_AFTER, "5")
+                .body("Tenant " + ex.getTenantId() + " is currently migrating between database shards. Please retry shortly.");
     }
 }
 ```
@@ -386,7 +492,7 @@ public class HeaderShardingKeyExtractor implements ShardingKeyExtractor {
 
 ## Technical Considerations and Dialect Constraints
 
-- **PostgreSQL Dependency in Rebalancer**: `TableDependencyResolver` queries PostgreSQL-specific constraint tables (`information_schema.table_constraints`, `key_column_usage`, `constraint_column_usage`). If rebalancing is used with MySQL, MariaDB, or Oracle, alternative metadata extraction queries or manual dependency ordering must be provided.
+- **ANSI SQL Schema Catalog in Rebalancer**: `TableDependencyResolver` inspects standard ANSI `information_schema.referential_constraints` and `information_schema.key_column_usage` views. This conforms to ANSI SQL standards and is fully supported on PostgreSQL, H2, and modern SQL engines. Dialects that deviate from ANSI standard information schema definitions can either configure `sharded-tables` explicitly or supply custom metadata extraction.
 - **Cross-Shard Queries**: Fractal is an application-level routing mechanism. Joins or cross-table queries across different physical shards are not supported at the JDBC layer and must be aggregated at the application layer.
 - **Global / Unpartitioned Entities**: Entities not mapped to a tenant or partition key must either reside on the `primary` datasource or use a dedicated routing aspect.
 ---
@@ -406,7 +512,16 @@ Execute the unit and integration test suite:
 mvn clean test
 ```
 
-The test suite includes:
-- `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes.
-- `RoutingIntegrationTest`: Verifies dynamic shard selection and SpEL resolution using in-memory H2 databases.
-- `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens in `SecurityContextHolder`.
+The test suite covers 28 automated tests across 10 test suites:
+- `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes on the 64-bit ring.
+- `RoutingIntegrationTest`: Verifies dynamic shard selection, primary fallback, and SpEL resolution using in-memory H2 databases.
+- `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens (`sub` claim) in `SecurityContextHolder`.
+- `CustomClaimSecurityRoutingIntegrationTest`: Tests end-to-end shard routing using custom JWT claims (e.g. `tenant_id`).
+- `JwtSecurityKeyExtractorTest`: Validates custom claim extraction, fallback logic, string/numeric/UUID claim conversions, and unauthenticated state handling.
+- `ShardingAspectMigrationLockTest`: Asserts that `TenantMigratingException` is thrown when accessing a tenant currently flagged as migrating.
+- `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution (`users` -> `projects` -> `tasks`), Kahn's topological sort for insert/delete ordering, join query synthesis, and table exclusion.
+- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity` and `@ShardedKey`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, cycle detection, reachability checks, and single-root enforcement.
+- `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans.
+- `RebalanceEngineTest`: Validates end-to-end tenant migration, row copying across shards using multi-hop plans, and reverse-order row pruning.
+
+

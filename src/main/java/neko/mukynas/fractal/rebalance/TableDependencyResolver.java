@@ -8,16 +8,32 @@ import java.util.*;
 public class TableDependencyResolver {
 
     private final JdbcTemplate primaryJdbcTemplate;
+    private List<TableForeignKey> explicitForeignKeys;
 
     public TableDependencyResolver(DataSource primaryDataSource) {
-        this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
+        this(primaryDataSource, null);
+    }
+
+    public TableDependencyResolver(DataSource primaryDataSource, List<TableForeignKey> explicitForeignKeys) {
+        this.primaryJdbcTemplate = primaryDataSource != null ? new JdbcTemplate(primaryDataSource) : null;
+        this.explicitForeignKeys = explicitForeignKeys;
+    }
+
+    public void setExplicitForeignKeys(List<TableForeignKey> explicitForeignKeys) {
+        this.explicitForeignKeys = explicitForeignKeys;
     }
 
     /**
-     * Loads all foreign key constraints from the system metadata catalog.
+     * Loads all foreign key constraints from explicit definitions or system metadata catalog.
      * Uses ANSI standard information_schema tables supported by PostgreSQL, H2, and other standard SQL engines.
      */
     public List<TableForeignKey> loadForeignKeys() {
+        if (explicitForeignKeys != null && !explicitForeignKeys.isEmpty()) {
+            return explicitForeignKeys;
+        }
+        if (primaryJdbcTemplate == null) {
+            return Collections.emptyList();
+        }
         String sql = """
             SELECT
                 kcu.table_name AS child_table,
