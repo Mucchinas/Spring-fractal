@@ -338,10 +338,10 @@ The migration progresses through two distinct phases:
 
 For each tenant identified in the delta plan:
 
-1. **Lock Entity**: Sets the tenant status to `MIGRATING` in memory and DB (via `status-column`). Intercepted requests throw a retryable `TenantMigratingException` to prevent dirty writes and split-brain states.
+1. **Lock Entity & Drain In-Flight Transactions**: Sets the tenant status to `MIGRATING` in memory and DB (via `status-column`). Intercepted requests throw a retryable `TenantMigratingException` to prevent dirty writes. The engine waits up to `drain-timeout` (default `10s`) for any pre-existing local in-flight transactions for that tenant to drain to 0 via `TopologyManager.awaitTenantQuiescence`. If in-flight transactions fail to drain, the migration for that tenant is safely deferred and status is restored to `ACTIVE`. A configurable `quiescence-period` (default `0s`) provides an optional cluster-wide pause for distributed transactions to finish committing.
 2. **Record Copy Phase**: Registers the tenant in `fractal_tenant_migrations` with `phase = 'COPYING'`.
 3. **Idempotent Target Sanitization**: Before streaming rows, the engine checks whether a prior interrupted attempt left partial rows on the target shard. If the source shard still holds the canonical data, any partial target rows are safely purged in reverse topological order to guarantee clean, idempotent batch inserts.
-4. **Data Replication**: Selects all matching rows using the pre-computed migration plans (with foreign key hopping) from the source shard and streams batch inserts into the target shard in chunks of 500 rows.
+4. **Data Replication**: Selects all matching rows using the pre-computed migration plans (with foreign key hopping) from the source shard and streams batch inserts into the target shard. Batch sizes are dynamically calculated ($\min(\text{batchSize}, \lfloor \text{maxBatchParameters} / \text{columnCount} \rfloor)$) to prevent database bind parameter overflow (such as PostgreSQL's 65,535 or SQLite's 32,766 limits).
 5. **Record Pruning Phase**: Updates `fractal_tenant_migrations` to `phase = 'PRUNING'`.
 6. **Data Eviction**: Removes migrated rows from the source shard in topological delete order (child tables first, root table last).
 7. **Clear Migration State**: Deletes the tenant record from `fractal_tenant_migrations`.
@@ -567,6 +567,10 @@ Configuration keys are grouped under the `fractal.sharding` prefix.
 | `fractal.sharding.rebalancer.shard-all` | `boolean` | `false` | When `true`, automatically shards all database tables (catalog discovery) except excluded tables, ignoring `@ShardedEntity`. |
 | `fractal.sharding.rebalancer.lock-timeout` | `Duration` | `15m` | Maximum lock expiration duration before an unreleased lock is considered dead and eligible for atomic takeover. |
 | `fractal.sharding.rebalancer.lock-refresh-interval` | `Duration` | `1m` | Periodic heartbeat interval for renewing `locked_at` during an active rebalance migration. |
+| `fractal.sharding.rebalancer.drain-timeout` | `Duration` | `10s` | Maximum duration to wait for pre-existing local in-flight transactions for a tenant to drain to 0 before deferring migration. |
+| `fractal.sharding.rebalancer.quiescence-period` | `Duration` | `0s` | Optional cluster-wide pause after setting `MIGRATING` status before copying data, giving remote nodes time to commit in-flight transactions. |
+| `fractal.sharding.rebalancer.batch-size` | `int` | `500` | Target chunk size for batch inserts during data copying and replica synchronization. |
+| `fractal.sharding.rebalancer.max-batch-parameters` | `int` | `32766` | Maximum total JDBC bind parameters per chunk ($batchSize \times columns \le maxParameters$) to prevent parameter overflow errors (e.g. Postgres 65,535). |
 | `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
 | `fractal.sharding.rebalancer.root-id-column` | `String` | - | Partition column name (e.g., `org_id`). Inferred from root `@ShardedKey` or `@Id` if omitted. |
 | `fractal.sharding.rebalancer.status-column` | `String` | - | Column on `rootTable` indicating migration state. Inferred from root `@ShardedStatus` if omitted. |
@@ -608,6 +612,10 @@ fractal:
       shard-all: false            # shard all DB tables except exclude-tables (ignores @ShardedEntity)
       lock-timeout: 15m           # lock expiration TTL for crash takeover (default: 15m)
       lock-refresh-interval: 1m   # periodic heartbeat to renew lock (default: 1m)
+      drain-timeout: 10s          # wait time for in-flight requests to complete before migration (default: 10s)
+      quiescence-period: 0s       # cluster-wide pause for distributed transactions (default: 0s)
+      batch-size: 500             # target batch size for row copying (default: 500)
+      max-batch-parameters: 32766 # max total JDBC bind parameters per chunk (default: 32766)
       # Zero-Config: When using @ShardedEntity(root = true), @ShardedKey, and @ShardedStatus,
       # root-table, root-id-column, status-column, and sharded-tables are 100% auto-discovered!
       # root-table: organizations
@@ -971,7 +979,7 @@ Execute the unit and integration test suite:
 mvn clean test
 ```
 
-The test suite covers 52 automated tests across 14 test suites:
+The test suite covers 57 automated tests across 15 test suites:
 - `ConsistentHashRouterTest`: Validates deterministic routing and uniform key distribution across virtual nodes on the 64-bit ring.
 - `RoutingIntegrationTest`: Verifies dynamic shard selection, primary fallback, and SpEL resolution using in-memory H2 databases.
 - `SecurityRoutingIntegrationTest`: Confirms end-to-end routing using synthetic JWT security tokens (`sub` claim) in `SecurityContextHolder`.
@@ -986,6 +994,7 @@ The test suite covers 52 automated tests across 14 test suites:
 - `ShardedBroadcastAspectTest`: Confirms parallel broadcast writes across primary database and all physical shards for `@ShardedBroadcast` service methods.
 - `TopologyManagerLockTest`: Verifies distributed lock acquisition, mutual exclusion, expired lock takeover via configurable TTL, periodic heartbeat renewal, graceful shutdown lock release, automatic schema initialization via `InitializingBean`, and idempotent ANSI shard registration.
 - `RebalanceEngineIdempotencyTest`: Asserts idempotent crash recovery across migration phases, resumption from aborted `COPYING` state (purging partial target data and recopying), resumption from aborted `PRUNING` state (safe source pruning without duplicate inserts), and safe repeated execution without side effects.
+- `QuiescenceAndBatchLimitTest`: Asserts in-flight request tracking, active execution draining via `awaitTenantQuiescence`, safe migration deferral on drain timeouts, cluster quiescence pauses, and dynamic chunk size calculation preventing bind parameter overflow on wide tables.
 
 
 
