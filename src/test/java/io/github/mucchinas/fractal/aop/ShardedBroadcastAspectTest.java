@@ -44,7 +44,6 @@ class ShardedBroadcastAspectTest {
         broadcastService.broadcastUpdate("EUR", 1.05);
 
         List<String> recorded = broadcastService.getRecordedContexts();
-        // First recorded should be null (representing primary default target datasource)
         assertThat(recorded).contains("primary", "shard-1", "shard-2");
         assertThat(ShardContextHolder.getShard()).isNull();
     }

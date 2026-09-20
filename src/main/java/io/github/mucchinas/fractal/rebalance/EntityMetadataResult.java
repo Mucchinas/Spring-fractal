@@ -8,11 +8,6 @@ import io.github.mucchinas.fractal.annotation.ShardedStatus;
 import java.util.Collections;
 import java.util.List;
 
-/**
- * Metadata resolved from domain classes annotated with {@link ShardedEntity},
- * {@link ShardedKey}, {@link ShardedStatus},
- * and {@link ShardedReplica}.
- */
 public record EntityMetadataResult(
         String rootTable,
         String rootIdColumn,

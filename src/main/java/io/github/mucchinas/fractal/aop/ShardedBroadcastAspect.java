@@ -10,10 +10,6 @@ import org.springframework.core.annotation.Order;
 
 import java.util.Set;
 
-/**
- * Intercepts methods annotated with {@link ShardedBroadcast} and replicates the operation
- * across the primary coordinator database and all configured physical shards.
- */
 @Aspect
 @Order(0)
 public class ShardedBroadcastAspect {
@@ -36,14 +32,10 @@ public class ShardedBroadcastAspect {
         boolean includePrimary = shardedBroadcast == null || shardedBroadcast.includePrimary();
 
         Object result = null;
-
-        // 1. Execute on primary coordinator database if requested
         if (includePrimary) {
-            ShardContextHolder.clear(); // null -> routes to default primary datasource
+            ShardContextHolder.clear();
             result = joinPoint.proceed();
         }
-
-        // 2. Replicate execution to all physical shards
         for (String shardName : shardNames) {
             try {
                 ShardContextHolder.setShard(shardName);

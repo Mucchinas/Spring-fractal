@@ -32,8 +32,6 @@ public class ConsistentHashRouter {
 
         long hash = md5Hash(key);
         SortedMap<Long, String> tailMap = ring.tailMap(hash);
-
-        // Se siamo oltre l'ultimo nodo, ripartiamo dal primo (chiusura dell'anello)
         Long nodeHash = tailMap.isEmpty() ? ring.firstKey() : tailMap.firstKey();
 
         return ring.get(nodeHash);
@@ -43,7 +41,6 @@ public class ConsistentHashRouter {
         try {
             MessageDigest md = MessageDigest.getInstance("MD5");
             byte[] digest = md.digest(key.getBytes(StandardCharsets.UTF_8));
-            // Converte i byte in un Long a 64 bit per la TreeMap
             return ((long) (digest[7] & 0xFF) << 56)
                     | ((long) (digest[6] & 0xFF) << 48)
                     | ((long) (digest[5] & 0xFF) << 40)

@@ -16,10 +16,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.*;
 
-/**
- * Manages shard topology, distributed locking with TTL/heartbeat,
- * and tracks in-flight tenant migrations for idempotent crash recovery.
- */
 public class TopologyManager implements InitializingBean, DisposableBean {
 
     public static final String REBALANCE_LOCK = "REBALANCE_LOCK";
@@ -149,7 +145,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     }
 
     private boolean checkMigrationInPrimaryDb(String tenantId, FractalProperties.RebalancerProperties props) {
-        // Check if there is an in-flight migration record in fractal_tenant_migrations
         try {
             List<String> phases = primaryJdbcTemplate.query(
                     "SELECT phase FROM fractal_tenant_migrations WHERE tenant_id = ?",
@@ -177,7 +172,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     }
 
     public void initializeSchema() {
-        // 1. Shard Topology Table
         primaryJdbcTemplate.execute("""
             CREATE TABLE IF NOT EXISTS fractal_shard_topology (
                 shard_name VARCHAR(255) PRIMARY KEY,
@@ -185,8 +179,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """);
-
-        // 2. Distributed Locks Table with Timestamp
         primaryJdbcTemplate.execute("""
             CREATE TABLE IF NOT EXISTS fractal_locks (
                 lock_name VARCHAR(255) PRIMARY KEY,
@@ -194,8 +186,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                 locked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """);
-
-        // 3. In-flight Tenant Migrations Table (for crash recovery & idempotent retries)
         primaryJdbcTemplate.execute("""
             CREATE TABLE IF NOT EXISTS fractal_tenant_migrations (
                 tenant_id VARCHAR(255) PRIMARY KEY,
@@ -223,27 +213,16 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                         shardName
                 );
             } catch (Exception ignored) {
-                // Ignore concurrent insert collision from another node
             }
         }
     }
 
-    /**
-     * Attempts to acquire the rebalance lock using default 15-minute TTL and 1-minute refresh interval.
-     */
     public boolean tryAcquireRebalanceLock() {
         return tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMinutes(1));
     }
 
-    /**
-     * Attempts to acquire the rebalance lock with configurable timeout and refresh interval.
-     * If the lock is already held, checks if it has expired beyond lockTimeout.
-     * If expired (due to a power outage or crash of another pod), atomically takes it over.
-     */
     public synchronized boolean tryAcquireRebalanceLock(Duration lockTimeout, Duration lockRefreshInterval) {
         Instant now = Instant.now();
-
-        // 1. Try atomic INSERT
         try {
             int inserted = primaryJdbcTemplate.update(
                     "INSERT INTO fractal_locks (lock_name, locked_by, locked_at) VALUES (?, ?, ?)",
@@ -255,10 +234,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                 return true;
             }
         } catch (Exception ignored) {
-            // Row already exists; proceed to expiration check
         }
-
-        // 2. Check and atomically take over expired stale lock
         long timeoutMs = lockTimeout != null ? lockTimeout.toMillis() : 900_000L;
         Timestamp expirationThreshold = Timestamp.from(now.minusMillis(timeoutMs));
 
@@ -277,9 +253,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         return false;
     }
 
-    /**
-     * Releases the rebalance lock if held by this instance and stops the heartbeat.
-     */
     public synchronized void releaseRebalanceLock() {
         stopHeartbeat();
         try {
@@ -294,9 +267,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         }
     }
 
-    /**
-     * Periodically refreshes the lock timestamp to prevent expiration during long migrations.
-     */
     private synchronized void startHeartbeat(Duration refreshInterval) {
         stopHeartbeat();
         long intervalMs = refreshInterval != null ? refreshInterval.toMillis() : 60_000L;
@@ -318,8 +288,6 @@ public class TopologyManager implements InitializingBean, DisposableBean {
             heartbeatTask = null;
         }
     }
-
-    // In-flight Migration Tracking for Idempotent Crash Recovery
 
     public void recordMigrationStart(String tenantId, String sourceShard, String targetShard) {
         if (tenantId != null) {

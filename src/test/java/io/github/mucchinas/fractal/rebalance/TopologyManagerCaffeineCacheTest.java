@@ -27,8 +27,6 @@ class TopologyManagerCaffeineCacheTest {
         config.setPassword("");
         dataSource = new HikariDataSource(config);
         jdbcTemplate = new JdbcTemplate(dataSource);
-
-        // Short TTL for testing: 300ms
         topologyManager = new TopologyManager(dataSource, true, Duration.ofMillis(300), 1000L);
         topologyManager.initializeSchema();
 
@@ -62,18 +60,10 @@ class TopologyManagerCaffeineCacheTest {
     void shouldCacheActiveStatusAndAvoidRepeatedDatabaseQueries() {
         String tenantId = "cached-tenant-1";
         jdbcTemplate.update("INSERT INTO organizations (org_id, name, sync_status) VALUES (?, ?, 'ACTIVE')", tenantId, "Active Corp");
-
-        // 1. Initial query: cache miss, queries DB, populates cache with false (not migrating)
         assertFalse(topologyManager.isTenantMigrating(tenantId, rebalProps));
         assertEquals(Boolean.FALSE, topologyManager.getMigrationStatusCache().getIfPresent(tenantId));
-
-        // 2. Modify DB directly behind the cache's back
         jdbcTemplate.update("UPDATE organizations SET sync_status = 'MIGRATING' WHERE org_id = ?", tenantId);
-
-        // 3. Within TTL (300ms), isTenantMigrating must still return FALSE from Caffeine cache!
         assertFalse(topologyManager.isTenantMigrating(tenantId, rebalProps), "Must hit cache and return FALSE within TTL");
-
-        // 4. Invalidate or mark active/migrating manually -> updates cache immediately
         topologyManager.markTenantMigrating(tenantId);
         assertTrue(topologyManager.isTenantMigrating(tenantId, rebalProps), "Cache was primed with true immediately");
 
@@ -85,21 +75,11 @@ class TopologyManagerCaffeineCacheTest {
     void shouldExpireCachedEntryAfterTtl() throws InterruptedException {
         String tenantId = "expiring-tenant-2";
         jdbcTemplate.update("INSERT INTO organizations (org_id, name, sync_status) VALUES (?, ?, 'ACTIVE')", tenantId, "Expiring Corp");
-
-        // First check caches false
         assertFalse(topologyManager.isTenantMigrating(tenantId, rebalProps));
         assertEquals(Boolean.FALSE, topologyManager.getMigrationStatusCache().getIfPresent(tenantId));
-
-        // Change DB to MIGRATING
         jdbcTemplate.update("UPDATE organizations SET sync_status = 'MIGRATING' WHERE org_id = ?", tenantId);
-
-        // Still false right now
         assertFalse(topologyManager.isTenantMigrating(tenantId, rebalProps));
-
-        // Wait 350ms to exceed 300ms TTL
         Thread.sleep(350);
-
-        // Now cache expired -> queries DB -> returns true!
         assertTrue(topologyManager.isTenantMigrating(tenantId, rebalProps), "Cache expired; reloaded MIGRATING from Primary DB");
     }
 }

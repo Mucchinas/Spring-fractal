@@ -23,12 +23,9 @@ public class JwtSecurityKeyExtractor implements ShardingKeyExtractor {
 
     @Override
     public String extractKey() {
-        // Leggiamo il contesto di sicurezza del thread corrente
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
 
         if (authentication != null && authentication.isAuthenticated()) {
-
-            // Se l'autenticazione è un JWT (Standard per Resource Server OAuth2)
             if (authentication instanceof JwtAuthenticationToken jwtAuthToken) {
                 if ("sub".equalsIgnoreCase(claimName)) {
                     return jwtAuthToken.getToken().getSubject();
@@ -36,11 +33,8 @@ public class JwtSecurityKeyExtractor implements ShardingKeyExtractor {
                 Object claimValue = jwtAuthToken.getToken().getClaims().get(claimName);
                 return claimValue != null ? String.valueOf(claimValue) : null;
             }
-
-            // Estensione futura: se volessimo supportare sessioni classiche
-            // else if (authentication.getPrincipal() instanceof UserDetails) { ... }
         }
 
-        return null; // Contesto assente o non supportato
+        return null;
     }
 }

@@ -44,7 +44,6 @@ class CustomClaimSecurityRoutingIntegrationTest {
 
     @Test
     void shouldRouteUsingCustomConfiguredJwtClaim() {
-        // Arrange: JWT with sub = user-123, but organization_id = acme-corp
         Jwt jwt = Jwt.withTokenValue("jwt-with-custom-claim")
                 .header("alg", "none")
                 .claim("sub", "user-123")
@@ -52,11 +51,7 @@ class CustomClaimSecurityRoutingIntegrationTest {
                 .build();
 
         SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt, List.of()));
-
-        // Act
         String targetShard = tenantService.executeAction();
-
-        // Assert
         assertThat(targetShard).isNotBlank().startsWith("shard-");
     }
 

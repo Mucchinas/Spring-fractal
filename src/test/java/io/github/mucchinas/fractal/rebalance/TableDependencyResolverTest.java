@@ -72,18 +72,12 @@ class TableDependencyResolverTest {
         List<TableMigrationPlan> plans = resolver.resolveMigrationPlans("users", "id", null, null);
 
         assertThat(plans).hasSize(4);
-
-        // Root table plan
         TableMigrationPlan usersPlan = plans.stream().filter(p -> p.tableName().equals("users")).findFirst().orElseThrow();
         assertThat(usersPlan.selectSql()).isEqualTo("SELECT * FROM users WHERE id = :userId");
         assertThat(usersPlan.deleteSql()).isEqualTo("DELETE FROM users WHERE id = :userId");
-
-        // 1st level child plan (projects)
         TableMigrationPlan projectsPlan = plans.stream().filter(p -> p.tableName().equals("projects")).findFirst().orElseThrow();
         assertThat(projectsPlan.selectSql()).isEqualTo("SELECT * FROM projects WHERE user_id = :userId");
         assertThat(projectsPlan.deleteSql()).isEqualTo("DELETE FROM projects WHERE user_id = :userId");
-
-        // 2nd level child plan (tasks) - has project_id, no user_id!
         TableMigrationPlan tasksPlan = plans.stream().filter(p -> p.tableName().equals("tasks")).findFirst().orElseThrow();
         assertThat(tasksPlan.selectSql())
                 .contains("SELECT tasks.* FROM tasks")
@@ -91,8 +85,6 @@ class TableDependencyResolverTest {
                 .contains("WHERE users.id = :userId");
         assertThat(tasksPlan.deleteSql())
                 .isEqualTo("DELETE FROM tasks WHERE project_id IN (SELECT id FROM projects WHERE user_id = :userId)");
-
-        // 3rd level child plan (comments) - has task_id, no project_id and no user_id!
         TableMigrationPlan commentsPlan = plans.stream().filter(p -> p.tableName().equals("comments")).findFirst().orElseThrow();
         assertThat(commentsPlan.selectSql())
                 .contains("SELECT comments.* FROM comments")

@@ -7,9 +7,5 @@ import java.lang.annotation.*;
 @Documented
 public @interface Sharded {
 
-    /**
-     * Espressione SpEL per estrarre la chiave di sharding dai parametri del metodo.
-     * Esempio: "#tenantId" oppure "#request.userId"
-     */
     String key() default "";
 }

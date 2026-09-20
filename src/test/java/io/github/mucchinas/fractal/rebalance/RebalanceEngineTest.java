@@ -33,8 +33,6 @@ class RebalanceEngineTest {
         primaryJdbc = new JdbcTemplate(primaryDs);
         shard1Jdbc = new JdbcTemplate(shard1Ds);
         shard2Jdbc = new JdbcTemplate(shard2Ds);
-
-        // Schema on primary: metadata table
         primaryJdbc.execute("DROP ALL OBJECTS");
         primaryJdbc.execute("""
             CREATE TABLE users (
@@ -43,21 +41,15 @@ class RebalanceEngineTest {
             )
         """);
         primaryJdbc.execute("INSERT INTO users VALUES ('user-1', 'ACTIVE'), ('user-2', 'ACTIVE')");
-
-        // Schema on shard1 and shard2
         for (JdbcTemplate shardJdbc : List.of(shard1Jdbc, shard2Jdbc)) {
             shardJdbc.execute("DROP ALL OBJECTS");
             shardJdbc.execute("CREATE TABLE users (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255))");
             shardJdbc.execute("CREATE TABLE projects (id VARCHAR(255) PRIMARY KEY, user_id VARCHAR(255), name VARCHAR(255), FOREIGN KEY (user_id) REFERENCES users(id))");
             shardJdbc.execute("CREATE TABLE tasks (id VARCHAR(255) PRIMARY KEY, project_id VARCHAR(255), title VARCHAR(255), FOREIGN KEY (project_id) REFERENCES projects(id))");
         }
-
-        // Insert test data on shard1
         shard1Jdbc.execute("INSERT INTO users VALUES ('user-1', 'Alice'), ('user-2', 'Bob')");
         shard1Jdbc.execute("INSERT INTO projects VALUES ('proj-1', 'user-1', 'Alpha'), ('proj-2', 'user-2', 'Beta')");
         shard1Jdbc.execute("INSERT INTO tasks VALUES ('task-1', 'proj-1', 'Task for Alice'), ('task-2', 'proj-2', 'Task for Bob')");
-
-        // Prepare FractalProperties
         FractalProperties properties = new FractalProperties();
         properties.getRebalancer().setEnabled(true);
         properties.getRebalancer().setRootTable("users");
@@ -75,8 +67,6 @@ class RebalanceEngineTest {
         shard2Props.setPassword("");
 
         properties.setShards(Map.of("shard-1", shard1Props, "shard-2", shard2Props));
-
-        // Use shard1 to resolve foreign keys
         TableDependencyResolver resolver = new TableDependencyResolver(shard1Ds);
         TopologyManager topologyManager = new TopologyManager(primaryDs);
 
@@ -85,14 +75,9 @@ class RebalanceEngineTest {
 
     @Test
     void shouldMigrateUserWithHierarchicalForeignKeysFromShard1ToShard2() {
-        // Arrange
         MigrationDeltaCalculator.MigrationAction action =
                 new MigrationDeltaCalculator.MigrationAction("user-1", "shard-1", "shard-2");
-
-        // Act
         rebalanceEngine.executeMigration(List.of(action));
-
-        // Assert: shard-2 received user-1 and all related child rows (projects, tasks)
         Integer targetUsers = shard2Jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE id = 'user-1'", Integer.class);
         Integer targetProjects = shard2Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE user_id = 'user-1'", Integer.class);
         Integer targetTasks = shard2Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE id = 'task-1'", Integer.class);
@@ -100,8 +85,6 @@ class RebalanceEngineTest {
         assertThat(targetUsers).isEqualTo(1);
         assertThat(targetProjects).isEqualTo(1);
         assertThat(targetTasks).isEqualTo(1);
-
-        // Assert: shard-1 had user-1 rows pruned
         Integer sourceUsers = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE id = 'user-1'", Integer.class);
         Integer sourceProjects = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE user_id = 'user-1'", Integer.class);
         Integer sourceTasks = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE id = 'task-1'", Integer.class);
@@ -109,8 +92,6 @@ class RebalanceEngineTest {
         assertThat(sourceUsers).isEqualTo(0);
         assertThat(sourceProjects).isEqualTo(0);
         assertThat(sourceTasks).isEqualTo(0);
-
-        // Assert: user-2 on shard-1 was NOT touched
         Integer remainingUser2 = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE id = 'user-2'", Integer.class);
         Integer remainingProj2 = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE user_id = 'user-2'", Integer.class);
         Integer remainingTask2 = shard1Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE id = 'task-2'", Integer.class);

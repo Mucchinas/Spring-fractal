@@ -29,8 +29,6 @@ public class RebalanceEngine {
                            TopologyManager topologyManager,
                            FractalProperties properties) {
         this(primaryDataSource, dependencyResolver, topologyManager, properties != null ? properties.getRebalancer() : new FractalProperties.RebalancerProperties());
-
-        // Inizializziamo i template JDBC per ogni shard fisico
         if (properties != null && properties.getShards() != null) {
             properties.getShards().forEach((name, dbProps) -> {
                 HikariConfig config = new HikariConfig();
@@ -67,8 +65,6 @@ public class RebalanceEngine {
 
     public void executeMigration(List<MigrationDeltaCalculator.MigrationAction> actions) {
         if (actions == null || actions.isEmpty()) return;
-
-        // 1. Risolviamo i piani di migrazione delle tabelle (auto-discovery e foreign key hopping)
         List<TableMigrationPlan> insertPlans = dependencyResolver.resolveMigrationPlans(
                 props.getRootTable(),
                 props.getRootIdColumn(),
@@ -77,8 +73,6 @@ public class RebalanceEngine {
                 props.getExcludeTables(),
                 props.isShardAll()
         );
-
-        // L'ordine per le DELETE è inverso all'ordine di INSERT (figli prima dei padri)
         List<TableMigrationPlan> deletePlans = new ArrayList<>(insertPlans);
         Collections.reverse(deletePlans);
 
@@ -87,14 +81,10 @@ public class RebalanceEngine {
             try {
                 System.out.println("FRACTAL: Migrazione utente " + userId +
                         " da " + action.sourceShard() + " a " + action.targetShard());
-
-                // 2. Lock del Tenant (Imposta MIGRATING in DB e in TopologyManager)
                 if (topologyManager != null) {
                     topologyManager.markTenantMigrating(userId);
                 }
                 setTenantStatus(userId, props.getMigratingValue());
-
-                // 2.1 Drain in-flight requests that started prior to migration lock
                 if (topologyManager != null) {
                     java.time.Duration drainTimeout = props.getDrainTimeout() != null ? props.getDrainTimeout() : java.time.Duration.ofSeconds(10);
                     boolean drained = topologyManager.awaitTenantQuiescence(userId, drainTimeout);
@@ -106,8 +96,6 @@ public class RebalanceEngine {
                         continue;
                     }
                 }
-
-                // 2.2 Cluster quiescence pause to allow distributed transactions to finish committing
                 if (props.getQuiescencePeriod() != null && !props.getQuiescencePeriod().isZero() && !props.getQuiescencePeriod().isNegative()) {
                     try {
                         Thread.sleep(props.getQuiescencePeriod().toMillis());
@@ -129,47 +117,32 @@ public class RebalanceEngine {
                 boolean targetHasData = hasRootRecord(userId, props.getRootTable(), props.getRootIdColumn(), target);
 
                 if (!sourceHasData && targetHasData) {
-                    // Migration has already completed previously (e.g. repeated action or crash after prune)
                     System.out.println("FRACTAL: Utente " + userId + " già presente su " + action.targetShard() + ", migrazione già completata.");
                 } else if (TopologyManager.PHASE_PRUNING.equalsIgnoreCase(existingPhase)) {
-                    // Previous run completed COPYING before interruption; resume by finishing PRUNING
                     System.out.println("FRACTAL: Ripresa migrazione da fase PRUNING per " + userId);
                     for (TableMigrationPlan plan : deletePlans) {
                         deleteTableData(userId, plan, source);
                     }
                 } else {
-                    // Fresh migration or previous run was interrupted during COPYING
                     if (topologyManager != null) {
                         topologyManager.recordMigrationStart(userId, action.sourceShard(), action.targetShard());
                     }
-
-                    // Idempotent target cleanup: remove any partial rows on target from previous aborted copy
                     for (TableMigrationPlan plan : deletePlans) {
                         deleteTableData(userId, plan, target);
                     }
-
-                    // Copy all tables in topological insert order
                     for (TableMigrationPlan plan : insertPlans) {
                         copyTableData(userId, plan, source, target);
                     }
-
-                    // Transition to PRUNING phase
                     if (topologyManager != null) {
                         topologyManager.updateMigrationPhase(userId, TopologyManager.PHASE_PRUNING);
                     }
-
-                    // Prune data from old shard in reverse topological order
                     for (TableMigrationPlan plan : deletePlans) {
                         deleteTableData(userId, plan, source);
                     }
                 }
-
-                // Clear migration tracking record
                 if (topologyManager != null) {
                     topologyManager.clearMigrationRecord(userId);
                 }
-
-                // 5. Sblocco del Tenant (Imposta ACTIVE in DB e in TopologyManager)
                 setTenantStatus(userId, props.getActiveValue());
                 if (topologyManager != null) {
                     topologyManager.markTenantActive(userId);
@@ -209,8 +182,6 @@ public class RebalanceEngine {
         }
 
         String insertSql = String.format("INSERT INTO %s (%s) VALUES (%s)", plan.tableName(), columns, placeholders);
-
-        // Calcolo dinamico della dimensione del batch per prevenire limiti sui parametri JDBC (es. Postgres 65535, SQLite 32766)
         int columnCount = firstRow.keySet().size();
         int batchSize = props.calculateBatchSize(columnCount);
         for (int i = 0; i < rows.size(); i += batchSize) {

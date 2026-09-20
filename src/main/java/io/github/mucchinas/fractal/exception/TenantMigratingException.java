@@ -1,9 +1,5 @@
 package io.github.mucchinas.fractal.exception;
 
-/**
- * Thrown when an operation is attempted on a tenant that is currently
- * undergoing shard migration / rebalancing.
- */
 public class TenantMigratingException extends IllegalStateException {
 
     private final String tenantId;

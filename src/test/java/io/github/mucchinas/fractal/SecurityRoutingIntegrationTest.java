@@ -40,14 +40,12 @@ class SecurityRoutingIntegrationTest {
     @BeforeEach
     @AfterEach
     void cleanUp() {
-        // Pulizia scrupolosa di ThreadLocal e SecurityContext tra un test e l'altro
         ShardContextHolder.clear();
         SecurityContextHolder.clearContext();
     }
 
     @Test
     void shouldExtractKeyFromJwtSecurityContext() {
-        // Arrange: Creiamo un finto token JWT con un "sub" (Subject)
         String userId = "auth0-user-999";
         Jwt jwt = Jwt.withTokenValue("finto-token-jwt")
                 .header("alg", "none")
@@ -55,27 +53,17 @@ class SecurityRoutingIntegrationTest {
                 .build();
 
         JwtAuthenticationToken authentication = new JwtAuthenticationToken(jwt, List.of());
-
-        // Inseriamo il token nel contesto di Spring Security del thread corrente
         SecurityContextHolder.getContext().setAuthentication(authentication);
-
-        // Act: Chiamiamo un metodo che NON usa SpEL. L'Aspect dovrà pescare il JWT
         String targetShard = businessService.eseguiQuerySicura();
-
-        // Assert
         assertThat(targetShard)
                 .isNotBlank()
-                .startsWith("shard-"); // Ha instradato con successo!
+                .startsWith("shard-");
 
         System.out.println("Utente JWT '" + userId + "' instradato automaticamente su: " + targetShard);
     }
 
     @Test
     void shouldThrowExceptionWhenNoKeyIsFound() {
-        // Arrange: SecurityContext vuoto (nessun login)
-
-        // Act & Assert: Chiamiamo un metodo senza SpEL fallback.
-        // Ci aspettiamo che l'Aspect sollevi un'eccezione chiara per bloccare l'operazione
         assertThatThrownBy(() -> businessService.eseguiQuerySicura())
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Impossibile determinare la chiave di sharding");
@@ -83,24 +71,13 @@ class SecurityRoutingIntegrationTest {
 
     @Test
     void shouldClearThreadLocalEvenWhenExceptionOccurs() {
-        // Arrange: Mettiamo un JWT valido per superare i controlli AOP
         Jwt jwt = Jwt.withTokenValue("finto").header("alg", "none").claim("sub", "user-1").build();
         SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt, List.of()));
-
-        // Act & Assert: Il metodo di business lancia un'eccezione Runtime.
         assertThatThrownBy(() -> businessService.queryCheFallisce())
                 .isInstanceOf(RuntimeException.class)
                 .hasMessage("Errore DB!");
-
-        // Assert CRITICO: Nonostante l'esplosione del metodo, il blocco "finally"
-        // dell'Aspect DEVE aver svuotato il contesto. Se questo fallisce, abbiamo un memory leak!
         assertThat(ShardContextHolder.getShard()).isNull();
     }
-
-
-    // =================================================================
-    // SETUP DELLA FALSA APPLICAZIONE PER IL TEST
-    // =================================================================
 
     @SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
     @Import({SecuredBusinessService.class, FractalAutoConfiguration.class})
@@ -109,7 +86,6 @@ class SecurityRoutingIntegrationTest {
     @Service
     static class SecuredBusinessService {
 
-        // Nota: non abbiamo messo l'attributo "key" (SpEL) qui!
         @Sharded
         public String eseguiQuerySicura() {
             return ShardContextHolder.getShard();

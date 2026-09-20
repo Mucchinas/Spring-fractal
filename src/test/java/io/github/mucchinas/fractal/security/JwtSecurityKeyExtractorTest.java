@@ -79,7 +79,6 @@ class JwtSecurityKeyExtractorTest {
                 .header("alg", "none")
                 .claim("sub", "user-123")
                 .build();
-        // 1-arg constructor creates unauthenticated token
         SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt));
 
         assertThat(extractor.extractKey()).isNull();

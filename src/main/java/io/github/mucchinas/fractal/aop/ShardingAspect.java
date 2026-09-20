@@ -20,7 +20,7 @@ import io.github.mucchinas.fractal.exception.TenantMigratingException;
 import io.github.mucchinas.fractal.rebalance.TopologyManager;
 
 @Aspect
-@Order(1) // CRITICO: Deve eseguire PRIMA dell'apertura della transazione Spring
+@Order(1)
 public class ShardingAspect {
 
     private final ConsistentHashRouter router;
@@ -46,16 +46,12 @@ public class ShardingAspect {
     @Around("@annotation(sharded)")
     public Object routeShard(ProceedingJoinPoint joinPoint, Sharded sharded) throws Throwable {
         String shardingKey = null;
-
-        // 1. Tenta di estrarre la chiave tramite le strategie (es. JWT Security)
         for (ShardingKeyExtractor extractor : keyExtractors.orderedStream().toList()) {
             shardingKey = extractor.extractKey();
             if (shardingKey != null && !shardingKey.isBlank()) {
-                break; // Chiave trovata, usciamo dal loop
+                break;
             }
         }
-
-        // 2. Fallback su SpEL se la chiave non è stata trovata (es. Job asincrono)
         if ((shardingKey == null || shardingKey.isBlank()) && !sharded.key().isBlank()) {
             MethodSignature signature = (MethodSignature) joinPoint.getSignature();
             String[] paramNames = signature.getParameterNames();
@@ -69,14 +65,10 @@ public class ShardingAspect {
             }
             shardingKey = parser.parseExpression(sharded.key()).getValue(context, String.class);
         }
-
-        // 3. Controllo finale
         if (shardingKey == null || shardingKey.isBlank()) {
             throw new IllegalStateException("Fractal Sharding: Impossibile determinare la chiave di sharding. " +
                     "SecurityContext vuoto/assente e parametro SpEL 'key' non fornito o nullo.");
         }
-
-        // 3.5. In-flight request tracking and migration status check
         TopologyManager topologyManager = topologyManagerProvider != null ? topologyManagerProvider.getIfAvailable() : null;
         FractalProperties properties = propertiesProvider != null ? propertiesProvider.getIfAvailable() : null;
 
@@ -90,18 +82,13 @@ public class ShardingAspect {
                     throw new TenantMigratingException(shardingKey);
                 }
             }
-
-            // 4. Routing verso il nodo virtuale
             String targetShard = router.routeNode(shardingKey);
             ShardContextHolder.setShard(targetShard);
-
-            // 5. Eseguiamo la query sul DB corretto
             return joinPoint.proceed();
         } finally {
             if (topologyManager != null) {
                 topologyManager.registerRequestEnd(shardingKey);
             }
-            // 6. Pulizia ThreadLocal obbligatoria
             ShardContextHolder.clear();
         }
     }

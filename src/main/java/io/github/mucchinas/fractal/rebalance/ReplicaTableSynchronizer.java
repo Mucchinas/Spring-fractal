@@ -9,14 +9,6 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import javax.sql.DataSource;
 import java.util.*;
 
-/**
- * Synchronizes Replicated (Broadcast) Reference Tables from the primary coordinator database
- * to all configured physical shards.
- *
- * <p>Reference tables (such as currencies, countries, system roles, and categories) are not
- * partitioned by tenant. Instead, 100% of their rows are copied to every physical shard database,
- * allowing local relational SQL queries and JOINs on any shard without cross-database network calls.</p>
- */
 public class ReplicaTableSynchronizer {
 
     private final NamedParameterJdbcTemplate primaryTemplate;
@@ -54,9 +46,6 @@ public class ReplicaTableSynchronizer {
         }
     }
 
-    /**
-     * Synchronizes all designated replica tables from the primary database to all active shards.
-     */
     public void syncAllReplicaTables(List<String> replicaTables) {
         if (replicaTables == null || replicaTables.isEmpty() || shardTemplates.isEmpty()) {
             return;
@@ -69,10 +58,6 @@ public class ReplicaTableSynchronizer {
         }
     }
 
-    /**
-     * Synchronizes all designated replica tables from the primary database to a specific target shard.
-     * Useful during cluster expansion when a newly added shard needs to be provisioned with reference data.
-     */
     public void syncAllReplicaTablesToShard(String shardName, List<String> replicaTables) {
         if (replicaTables == null || replicaTables.isEmpty() || shardName == null) {
             return;
@@ -91,9 +76,6 @@ public class ReplicaTableSynchronizer {
         }
     }
 
-    /**
-     * Synchronizes a single replica table from the primary database to all active shards.
-     */
     public void syncTable(String tableName) {
         if (tableName == null || tableName.isBlank() || shardTemplates.isEmpty()) {
             return;
@@ -130,7 +112,6 @@ public class ReplicaTableSynchronizer {
 
     private void syncRowsToTarget(String tableName, List<Map<String, Object>> rows, NamedParameterJdbcTemplate target) {
         try {
-            // Remove existing rows to ensure an exact replica of primary data without PK conflicts
             target.getJdbcTemplate().execute("DELETE FROM " + tableName);
 
             if (rows.isEmpty()) {

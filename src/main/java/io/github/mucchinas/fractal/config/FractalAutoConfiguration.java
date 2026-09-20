@@ -83,7 +83,6 @@ public class FractalAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public TopologyManager topologyManager(FractalProperties properties) {
-        // Costruiamo il datasource primario appositamente per le logiche di admin
         DataSource primary = buildDataSource(properties.getPrimary());
         boolean autoInitSchema = properties.getPrimary() == null || properties.getPrimary().isInitializeSchema();
         java.time.Duration cacheTtl = properties.getRebalancer() != null ? properties.getRebalancer().getStatusCacheTtl() : java.time.Duration.ofSeconds(2);
@@ -91,18 +90,13 @@ public class FractalAutoConfiguration {
         return new TopologyManager(primary, autoInitSchema, cacheTtl, cacheMaxSize);
     }
 
-    /**
-     * Thread Pool dedicato ESCLUSIVAMENTE al Rebalancer.
-     * È limitato a 1 singolo thread, con priorità minima per non rubare CPU alle richieste HTTP.
-     */
     @Bean
     public ThreadPoolTaskExecutor fractalRebalanceExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
         executor.setCorePoolSize(1);
         executor.setMaxPoolSize(1);
-        executor.setQueueCapacity(10); // Code piccolissime
+        executor.setQueueCapacity(10);
         executor.setThreadNamePrefix("fractal-rebalancer-");
-        // Abbassiamo la priorità del thread a livello sistema operativo/JVM
         executor.setThreadPriority(Thread.MIN_PRIORITY);
         executor.setWaitForTasksToCompleteOnShutdown(true);
         executor.setAwaitTerminationSeconds(30);
@@ -184,7 +178,6 @@ public class FractalAutoConfiguration {
                 properties.getRebalancer().setReplicaTables(replicaTables);
                 properties.getRebalancer().setShardedTables(shardedTables);
             } else {
-                // Infer root-table, root-id-column, replica-tables, and sharded-tables from entities if not explicitly configured in YAML
                 try {
                     EntityMetadataResult entityResult = entityMetadataResolver.resolve();
                     if (entityResult != null) {
@@ -222,19 +215,12 @@ public class FractalAutoConfiguration {
                     System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
                 }
             }
-
-            // Synchronize all replica reference tables across physical shards on startup
             replicaTableSynchronizer.syncAllReplicaTables(properties.getRebalancer().getReplicaTables());
 
             if (properties.getRebalancer().isEnabled()) {
-                // 1. Crea le tabelle se non esistono
                 topologyManager.initializeSchema();
-
-                // 2. Legge dal file properties gli shard attuali
                 Set<String> yamlShards = properties.getShards().keySet();
                 List<String> dbShards = topologyManager.getKnownShardsFromDb();
-
-                // 3. Controlla se ci sono shard nuovi nello YAML o migrazioni interrotte da completare
                 boolean hasNewShards = yamlShards.stream().anyMatch(s -> !dbShards.contains(s));
                 List<TopologyManager.PendingMigration> pendingMigrations = topologyManager.getPendingMigrations();
                 boolean hasPending = !pendingMigrations.isEmpty();
@@ -260,16 +246,12 @@ public class FractalAutoConfiguration {
                                     });
                                     return;
                                 }
-
-                                // 1. Risoluzione idempotente di migrazioni interrotte da un precedente crash
                                 if (!pendingMigrations.isEmpty()) {
                                     List<MigrationDeltaCalculator.MigrationAction> recoveryActions = pendingMigrations.stream()
                                             .map(p -> new MigrationDeltaCalculator.MigrationAction(p.tenantId(), p.sourceShard(), p.targetShard()))
                                             .toList();
                                     rebalanceEngine.executeMigration(recoveryActions);
                                 }
-
-                                // 2. Esecuzione del delta per i nuovi shard
                                 if (hasNewShards) {
                                     MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(
                                             buildDataSource(properties.getPrimary()),
@@ -308,11 +290,6 @@ public class FractalAutoConfiguration {
         return new HikariDataSource(config);
     }
 
-    /**
-     * CONFIGURAZIONE OPZIONALE PER SPRING SECURITY
-     * Questa classe interna viene processata SOLO SE Spring Security OAuth2 è presente nel classpath.
-     * Altrimenti viene ignorata e non causa ClassNotFoundException.
-     */
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnClass(name = {
             "org.springframework.security.core.context.SecurityContextHolder",

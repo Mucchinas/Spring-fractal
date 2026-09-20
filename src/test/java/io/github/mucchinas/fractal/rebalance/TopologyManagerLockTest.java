@@ -46,21 +46,15 @@ class TopologyManagerLockTest {
     void shouldAcquireAndReleaseLock() {
         assertTrue(topologyManager.tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMinutes(1)));
         assertTrue(topologyManager.isLockHeld());
-
-        // Verify row in DB
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM fractal_locks WHERE lock_name = 'REBALANCE_LOCK'", Integer.class);
         assertEquals(1, count);
-
-        // Second acquisition by same or different instance fails while active
         TopologyManager secondManager = new TopologyManager(dataSource);
         try {
             assertFalse(secondManager.tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMinutes(1)));
         } finally {
             secondManager.destroy();
         }
-
-        // Release lock
         topologyManager.releaseRebalanceLock();
         assertFalse(topologyManager.isLockHeld());
 
@@ -71,14 +65,11 @@ class TopologyManagerLockTest {
 
     @Test
     void shouldTakeOverExpiredStaleLock() {
-        // Simulate an abandoned lock from an instance that crashed 30 minutes ago
         Timestamp staleTimestamp = Timestamp.from(Instant.now().minus(Duration.ofMinutes(30)));
         jdbcTemplate.update(
                 "INSERT INTO fractal_locks (lock_name, locked_by, locked_at) VALUES ('REBALANCE_LOCK', 'dead-instance', ?)",
                 staleTimestamp
         );
-
-        // A new instance attempts to acquire with 15-minute timeout
         TopologyManager newManager = new TopologyManager(dataSource);
         try {
             assertTrue(newManager.tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMinutes(1)));
@@ -96,8 +87,6 @@ class TopologyManagerLockTest {
     void shouldReleaseLockOnGracefulShutdown() {
         assertTrue(topologyManager.tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMinutes(1)));
         assertTrue(topologyManager.isLockHeld());
-
-        // Trigger destroy (simulates Spring context shutdown / SIGTERM)
         topologyManager.destroy();
         assertFalse(topologyManager.isLockHeld());
 
@@ -108,14 +97,11 @@ class TopologyManagerLockTest {
 
     @Test
     void shouldPeriodicallyRefreshHeartbeat() throws InterruptedException {
-        // Acquire with very short refresh interval (50ms)
         assertTrue(topologyManager.tryAcquireRebalanceLock(Duration.ofMinutes(15), Duration.ofMillis(50)));
 
         Timestamp initialTimestamp = jdbcTemplate.queryForObject(
                 "SELECT locked_at FROM fractal_locks WHERE lock_name = 'REBALANCE_LOCK'", Timestamp.class);
         assertNotNull(initialTimestamp);
-
-        // Wait for heartbeat to fire
         Thread.sleep(150);
 
         Timestamp refreshedTimestamp = jdbcTemplate.queryForObject(

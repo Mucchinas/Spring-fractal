@@ -88,22 +88,12 @@ class QuiescenceAndBatchLimitTest {
         FractalProperties.RebalancerProperties props = new FractalProperties.RebalancerProperties();
         props.setBatchSize(500);
         props.setMaxBatchParameters(32766);
-
-        // Few columns: stays at 500
         assertThat(props.calculateBatchSize(5)).isEqualTo(500);
         assertThat(props.calculateBatchSize(10)).isEqualTo(500);
-
-        // Wide table (140 columns): 32766 / 140 = 234
         assertThat(props.calculateBatchSize(140)).isEqualTo(234);
-
-        // Ultra-wide table (500 columns): 32766 / 500 = 65
         assertThat(props.calculateBatchSize(500)).isEqualTo(65);
-
-        // SQL Server limit profile (max parameters = 2000)
         props.setMaxBatchParameters(2000);
         assertThat(props.calculateBatchSize(50)).isEqualTo(40);
-
-        // Edge case: 0 or negative columns
         assertThat(props.calculateBatchSize(0)).isEqualTo(500);
         assertThat(props.calculateBatchSize(-1)).isEqualTo(500);
     }
@@ -127,26 +117,20 @@ class QuiescenceAndBatchLimitTest {
         properties.getRebalancer().setRootIdColumn("id");
         properties.getRebalancer().setStatusColumn("status");
         properties.getRebalancer().setShardedTables(List.of("users"));
-        properties.getRebalancer().setDrainTimeout(Duration.ofMillis(100)); // fast timeout for test
+        properties.getRebalancer().setDrainTimeout(Duration.ofMillis(100));
 
         TableDependencyResolver resolver = new TableDependencyResolver(primaryDs);
         Map<String, DataSource> shardMap = Map.of("shard-1", shard1Ds, "shard-2", shard2Ds);
         RebalanceEngine engine = new RebalanceEngine(primaryDs, shardMap, resolver, topologyManager, properties.getRebalancer());
-
-        // Simulate an active in-flight request on user-busy that remains open
         topologyManager.registerRequestStart("user-busy");
         try {
             MigrationDeltaCalculator.MigrationAction action =
                     new MigrationDeltaCalculator.MigrationAction("user-busy", "shard-1", "shard-2");
             engine.executeMigration(List.of(action));
-
-            // Migration should have been deferred: data remains on shard-1, not migrated to shard-2
             Integer s1Count = s1.queryForObject("SELECT COUNT(*) FROM users WHERE id = 'user-busy'", Integer.class);
             Integer s2Count = s2.queryForObject("SELECT COUNT(*) FROM users WHERE id = 'user-busy'", Integer.class);
             assertThat(s1Count).isEqualTo(1);
             assertThat(s2Count).isEqualTo(0);
-
-            // Status restored to ACTIVE
             String status = prim.queryForObject("SELECT status FROM users WHERE id = 'user-busy'", String.class);
             assertThat(status).isEqualTo("ACTIVE");
         } finally {
@@ -173,8 +157,7 @@ class QuiescenceAndBatchLimitTest {
         properties.getRebalancer().setRootIdColumn("id");
         properties.getRebalancer().setStatusColumn("status");
         properties.getRebalancer().setShardedTables(List.of("accounts"));
-        // Force very small max parameters so batch size is constrained
-        properties.getRebalancer().setMaxBatchParameters(12); // 6 columns => batchSize = 12 / 6 = 2
+        properties.getRebalancer().setMaxBatchParameters(12);
         properties.getRebalancer().setDrainTimeout(Duration.ofMillis(200));
 
         TableDependencyResolver resolver = new TableDependencyResolver(primaryDs);

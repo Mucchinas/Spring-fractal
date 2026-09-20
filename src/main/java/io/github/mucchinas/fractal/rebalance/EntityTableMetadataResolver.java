@@ -17,11 +17,6 @@ import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.util.*;
 
-/**
- * Discovers and validates entities annotated with {@link ShardedEntity}, {@link ShardedKey},
- * and {@link ShardedReplica}.
- * Generates topological foreign key hops, root table mappings, and table discovery metadata.
- */
 public class EntityTableMetadataResolver {
 
     private final ApplicationContext applicationContext;
@@ -34,10 +29,6 @@ public class EntityTableMetadataResolver {
         this.applicationContext = applicationContext;
     }
 
-    /**
-     * Resolves metadata by scanning base packages of the Spring Boot application.
-     * Returns null if no @ShardedEntity or @ShardedReplica classes are detected.
-     */
     public EntityMetadataResult resolve() {
         Set<Class<?>> entityClasses = scanEntityClasses();
         if (entityClasses.isEmpty()) {
@@ -46,9 +37,6 @@ public class EntityTableMetadataResolver {
         return resolveFromClasses(entityClasses);
     }
 
-    /**
-     * Resolves metadata from a specific collection of classes.
-     */
     public EntityMetadataResult resolveFromClasses(Collection<Class<?>> classes) {
         if (classes == null || classes.isEmpty()) {
             return null;
@@ -99,7 +87,7 @@ public class EntityTableMetadataResolver {
         }
 
         List<TableForeignKey> foreignKeys = new ArrayList<>();
-        Map<String, String> hopGraph = new HashMap<>(); // childTable -> parentTable
+        Map<String, String> hopGraph = new HashMap<>();
 
         for (Class<?> clazz : shardedClasses) {
             if (clazz.equals(rootClass)) {
@@ -113,7 +101,6 @@ public class EntityTableMetadataResolver {
 
             Class<?> targetClass = keyInfo.targetEntity();
             if (targetClass == null || targetClass.equals(Void.class)) {
-                // Check if field type itself is an annotated entity
                 if (keyInfo.type() != null && keyInfo.type().isAnnotationPresent(ShardedEntity.class)) {
                     targetClass = keyInfo.type();
                 } else {
@@ -143,16 +130,12 @@ public class EntityTableMetadataResolver {
             foreignKeys.add(new TableForeignKey(childTable, childColumn, parentTable, parentColumn));
             hopGraph.put(childTable, parentTable);
         }
-
-        // Validate that no descendant entity declares @ShardedStatus
         for (Class<?> clazz : shardedClasses) {
             if (!clazz.equals(rootClass) && hasShardedStatusAnnotation(clazz)) {
                 throw new IllegalStateException("Entity '" + clazz.getName()
                         + "' declares @ShardedStatus but is not the root @ShardedEntity. @ShardedStatus is only permitted on the root entity.");
             }
         }
-
-        // Validate graph connectivity: each child table must reach rootTable
         for (Class<?> clazz : shardedClasses) {
             if (clazz.equals(rootClass)) {
                 continue;
@@ -175,8 +158,6 @@ public class EntityTableMetadataResolver {
         String statusColumn = statusInfo != null ? statusInfo.columnName() : null;
         String migratingValue = statusInfo != null ? statusInfo.migratingValue() : null;
         String activeValue = statusInfo != null ? statusInfo.activeValue() : null;
-
-        // Compute insert order (Kahn's topological sort)
         List<String> insertOrder = computeTopologicalOrder(rootTable, tableNames.values(), foreignKeys);
 
         return new EntityMetadataResult(rootTable, rootIdColumn, statusColumn, migratingValue, activeValue, insertOrder, foreignKeys, replicaTables);
@@ -216,8 +197,6 @@ public class EntityTableMetadataResolver {
                 }
             }
         }
-
-        // Include any remaining unvisited tables
         for (String table : allTables) {
             String normalized = table.toLowerCase();
             if (!order.contains(normalized)) {
@@ -233,8 +212,6 @@ public class EntityTableMetadataResolver {
         if (ann != null && !ann.table().isBlank()) {
             return ann.table().toLowerCase();
         }
-
-        // Check JPA @Table(name = "...") via reflection
         try {
             Class<?> tableAnnotationClass = Class.forName("jakarta.persistence.Table");
             if (clazz.isAnnotationPresent((Class<? extends Annotation>) tableAnnotationClass)) {
@@ -256,8 +233,6 @@ public class EntityTableMetadataResolver {
         if (ann != null && !ann.table().isBlank()) {
             return ann.table().toLowerCase();
         }
-
-        // Check JPA @Table(name = "...") via reflection
         try {
             Class<?> tableAnnotationClass = Class.forName("jakarta.persistence.Table");
             if (clazz.isAnnotationPresent((Class<? extends Annotation>) tableAnnotationClass)) {
@@ -339,8 +314,6 @@ public class EntityTableMetadataResolver {
         if (explicitColumn != null && !explicitColumn.isBlank()) {
             return explicitColumn.toLowerCase();
         }
-
-        // Check JPA @JoinColumn(name = "...")
         try {
             Class<?> joinColClass = Class.forName("jakarta.persistence.JoinColumn");
             if (isAnnotationPresent(member, (Class<? extends Annotation>) joinColClass)) {
@@ -352,8 +325,6 @@ public class EntityTableMetadataResolver {
             }
         } catch (Throwable ignored) {
         }
-
-        // Check JPA @Column(name = "...")
         try {
             Class<?> colClass = Class.forName("jakarta.persistence.Column");
             if (isAnnotationPresent(member, (Class<? extends Annotation>) colClass)) {
@@ -421,7 +392,6 @@ public class EntityTableMetadataResolver {
         }
 
         if (packages.isEmpty()) {
-            // Default to package of SpringBootApplication if present
             Map<String, Object> annotatedBeans = applicationContext.getBeansWithAnnotation(
                     org.springframework.boot.autoconfigure.SpringBootApplication.class
             );

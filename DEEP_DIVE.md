@@ -1014,10 +1014,11 @@ Because sharded tables and primary tables reside in different physical database 
 #### Pattern 1: Application-Level Join via Orchestrator Facade (Recommended)
 
 ```java
-// 1. Sharded Service: executes queries on tenant's assigned shard
+/* 1. Sharded Service: executes queries on tenant's assigned shard */
 @Service
 public class OrderService {
-    @Autowired private OrderRepository orderRepository;
+    @Autowired
+    private OrderRepository orderRepository;
 
     @Sharded(key = "#tenantId")
     @Transactional(readOnly = true)
@@ -1026,12 +1027,13 @@ public class OrderService {
     }
 }
 
-// 2. Non-Sharded Service: executes queries on primary coordination database
+/* 2. Non-Sharded Service: executes queries on primary coordination database */
 @Service
 public class CurrencyService {
-    @Autowired private CurrencyRateRepository currencyRepository;
+    @Autowired
+    private CurrencyRateRepository currencyRepository;
 
-    // No @Sharded annotation -> routes to primary datasource
+    /* No @Sharded annotation -> routes to primary datasource */// No @Sharded annotation -> routes to primary datasource
     @Transactional(readOnly = true)
     public Map<String, BigDecimal> getExchangeRates() {
         return currencyRepository.findAllAsRateMap();

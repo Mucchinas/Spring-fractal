@@ -25,7 +25,6 @@ class EntityRebalanceIntegrationTest {
     private JdbcTemplate shard1Jdbc;
     private JdbcTemplate shard2Jdbc;
 
-    // Domain entities with multi-hop hierarchy
     @ShardedEntity(table = "organizations", root = true)
     static class OrgEntity {
         @ShardedKey(column = "org_id")
@@ -59,9 +58,6 @@ class EntityRebalanceIntegrationTest {
 
         shard1Jdbc = new JdbcTemplate(shard1Ds);
         shard2Jdbc = new JdbcTemplate(shard2Ds);
-
-        // Note: NO physical database foreign key constraints are defined in the schema!
-        // The dependency hierarchy is discovered solely from @ShardedEntity and @ShardedKey.
         String schema = """
             CREATE TABLE organizations (org_id VARCHAR(50) PRIMARY KEY, name VARCHAR(100), sync_status VARCHAR(20));
             CREATE TABLE projects (id VARCHAR(50) PRIMARY KEY, name VARCHAR(100), org_id VARCHAR(50));
@@ -86,13 +82,10 @@ class EntityRebalanceIntegrationTest {
 
     @Test
     void shouldRebalanceMultiHopEntitiesWithoutPhysicalDatabaseForeignKeys() {
-        // Seed test data on shard1
         shard1Jdbc.update("INSERT INTO organizations (org_id, name, sync_status) VALUES ('org-42', 'Acme Corp', 'ACTIVE')");
         shard1Jdbc.update("INSERT INTO projects (id, name, org_id) VALUES ('proj-1', 'Fractal Project', 'org-42')");
         shard1Jdbc.update("INSERT INTO tasks (id, title, project_id) VALUES ('task-1', 'Build Entity Auto Discovery', 'proj-1')");
         shard1Jdbc.update("INSERT INTO tasks (id, title, project_id) VALUES ('task-2', 'Add Tests', 'proj-1')");
-
-        // Resolve metadata from annotations
         EntityTableMetadataResolver metadataResolver = new EntityTableMetadataResolver();
         EntityMetadataResult metadata = metadataResolver.resolveFromClasses(
                 List.of(OrgEntity.class, ProjectEntity.class, TaskEntity.class)
@@ -102,8 +95,6 @@ class EntityRebalanceIntegrationTest {
         assertEquals("org_id", metadata.rootIdColumn());
         assertEquals("sync_status", metadata.statusColumn());
         assertEquals(List.of("organizations", "projects", "tasks"), metadata.shardedTables());
-
-        // Configure TableDependencyResolver with entity-resolved foreign keys
         TableDependencyResolver dependencyResolver = new TableDependencyResolver(primaryDs, metadata.foreignKeys());
 
         FractalProperties properties = new FractalProperties();
@@ -128,19 +119,13 @@ class EntityRebalanceIntegrationTest {
         topologyManager.initializeSchema();
 
         RebalanceEngine engine = new RebalanceEngine(primaryDs, dependencyResolver, topologyManager, properties);
-
-        // Execute migration action
         MigrationDeltaCalculator.MigrationAction action =
                 new MigrationDeltaCalculator.MigrationAction("org-42", "shard-1", "shard-2");
 
         engine.executeMigration(List.of(action));
-
-        // Assert all rows migrated to shard-2 via multi-hop plans
         assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-42'", Integer.class));
         assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE org_id = 'org-42'", Integer.class));
         assertEquals(2, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE project_id = 'proj-1'", Integer.class));
-
-        // Assert rows pruned from shard-1
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-42'", Integer.class));
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM projects WHERE org_id = 'org-42'", Integer.class));
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM tasks WHERE project_id = 'proj-1'", Integer.class));
@@ -223,15 +208,11 @@ class EntityRebalanceIntegrationTest {
         new JdbcTemplate(primaryDs).execute(schema);
         shard1Jdbc.execute(schema);
         shard2Jdbc.execute(schema);
-
-        // Seed currencies on primary and synchronize to both shards
         new JdbcTemplate(primaryDs).update("INSERT INTO currencies (code, rate) VALUES ('EUR', 1.0)");
         new JdbcTemplate(primaryDs).update("INSERT INTO currencies (code, rate) VALUES ('USD', 1.08)");
 
         ReplicaTableSynchronizer synchronizer = new ReplicaTableSynchronizer(primaryDs, Map.of("shard-1", shard1Ds, "shard-2", shard2Ds));
         synchronizer.syncAllReplicaTables(List.of("currencies"));
-
-        // Seed tenant data on shard1
         shard1Jdbc.update("INSERT INTO organizations (org_id, name, sync_status) VALUES ('org-55', 'Acme Global', 'ACTIVE')");
 
         TableDependencyResolver dependencyResolver = new TableDependencyResolver(primaryDs);
@@ -263,12 +244,8 @@ class EntityRebalanceIntegrationTest {
                 new MigrationDeltaCalculator.MigrationAction("org-55", "shard-1", "shard-2");
 
         engine.executeMigration(List.of(action));
-
-        // Tenant migrated to shard-2 and pruned from shard-1
         assertEquals(1, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-55'", Integer.class));
         assertEquals(0, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM organizations WHERE org_id = 'org-55'", Integer.class));
-
-        // Replicated reference table is PRESERVED on BOTH shards (never deleted during tenant prune)
         assertEquals(2, shard1Jdbc.queryForObject("SELECT COUNT(*) FROM currencies", Integer.class));
         assertEquals(2, shard2Jdbc.queryForObject("SELECT COUNT(*) FROM currencies", Integer.class));
     }

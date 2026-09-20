@@ -67,15 +67,10 @@ class ShardingAspectMigrationLockTest {
 
     @Test
     void shouldThrowTenantMigratingExceptionWhenTenantIsMigrating() {
-        // Mark tenant as migrating
         topologyManager.markTenantMigrating("tenant-locked");
-
-        // Act & Assert: Aspect must block access to prevent dirty writes during migration
         assertThatThrownBy(() -> workService.processTenant("tenant-locked"))
                 .isInstanceOf(TenantMigratingException.class)
                 .hasMessageContaining("Tenant 'tenant-locked' is currently undergoing shard rebalancing");
-
-        // ThreadLocal must remain clean
         assertThat(ShardContextHolder.getShard()).isNull();
     }
 

@@ -23,10 +23,6 @@ public class TableDependencyResolver {
         this.explicitForeignKeys = explicitForeignKeys;
     }
 
-    /**
-     * Loads all foreign key constraints from explicit definitions or system metadata catalog.
-     * Uses ANSI standard information_schema tables supported by PostgreSQL, H2, and other standard SQL engines.
-     */
     public List<TableForeignKey> loadForeignKeys() {
         if (explicitForeignKeys != null && !explicitForeignKeys.isEmpty()) {
             return explicitForeignKeys;
@@ -64,10 +60,6 @@ public class TableDependencyResolver {
         return fks;
     }
 
-    /**
-     * Discovers all user tables in the database catalog (excluding system schemas and Fractal metadata tables),
-     * filtering out tables in excludeTables.
-     */
     public List<String> discoverAllDatabaseTables(List<String> excludeTables) {
         if (primaryJdbcTemplate == null) {
             return Collections.emptyList();
@@ -108,10 +100,6 @@ public class TableDependencyResolver {
         return tables;
     }
 
-    /**
-     * Identifies replicated reference tables from database catalog when shardAll is true,
-     * or returns explicitReplicaTables.
-     */
     public List<String> discoverReplicaTables(String rootTable, List<String> explicitReplicaTables, List<String> excludeTables, boolean shardAll) {
         Set<String> replicas = new LinkedHashSet<>();
         if (explicitReplicaTables != null) {
@@ -136,31 +124,20 @@ public class TableDependencyResolver {
             }
             List<TableForeignKey> path = findPathToRoot(table, normRoot, allFks);
             if (path.isEmpty()) {
-                // Table has no foreign key relationship to rootTable -> it is a replicated table!
                 replicas.add(table);
             }
         }
         return new ArrayList<>(replicas);
     }
 
-    /**
-     * Auto-discovers all sharded tables starting from rootTable by tracing foreign keys.
-     * If explicitTables is provided and non-empty, it is used instead of auto-discovery.
-     */
     public List<String> discoverShardedTables(String rootTable, List<String> explicitTables, List<String> excludeTables) {
         return discoverShardedTables(rootTable, explicitTables, Collections.emptyList(), excludeTables, false);
     }
 
-    /**
-     * Discovers sharded tables. If shardAll is true, includes all database tables except exclusions and replicas.
-     */
     public List<String> discoverShardedTables(String rootTable, List<String> explicitTables, List<String> excludeTables, boolean shardAll) {
         return discoverShardedTables(rootTable, explicitTables, Collections.emptyList(), excludeTables, shardAll);
     }
 
-    /**
-     * Discovers sharded tables, separating partitioned tables from replicated tables.
-     */
     public List<String> discoverShardedTables(String rootTable, List<String> explicitTables, List<String> replicaTables, List<String> excludeTables, boolean shardAll) {
         if (shardAll) {
             List<String> allTables = discoverAllDatabaseTables(excludeTables);
@@ -235,9 +212,6 @@ public class TableDependencyResolver {
         return new ArrayList<>(discovered);
     }
 
-    /**
-     * Resolves topological sort order for insertion (parents before children).
-     */
     public List<String> resolveInsertOrder(List<String> tables) {
         if (tables == null || tables.isEmpty()) {
             return Collections.emptyList();
@@ -293,9 +267,6 @@ public class TableDependencyResolver {
         return insertOrder;
     }
 
-    /**
-     * Delete order is the reverse of insert order (children before parents).
-     */
     public List<String> resolveDeleteOrder(List<String> tables) {
         List<String> insertOrder = resolveInsertOrder(tables);
         List<String> deleteOrder = new ArrayList<>(insertOrder);
@@ -303,10 +274,6 @@ public class TableDependencyResolver {
         return deleteOrder;
     }
 
-    /**
-     * Builds migration plans (SELECT and DELETE queries with foreign key hopping)
-     * for all sharded tables in topological insert order.
-     */
     public List<TableMigrationPlan> resolveMigrationPlans(String rootTable,
                                                          String rootIdColumn,
                                                          List<String> explicitTables,
@@ -314,10 +281,6 @@ public class TableDependencyResolver {
         return resolveMigrationPlans(rootTable, rootIdColumn, explicitTables, excludeTables, false);
     }
 
-    /**
-     * Builds migration plans (SELECT and DELETE queries with foreign key hopping)
-     * for all sharded tables in topological insert order, supporting shardAll flag.
-     */
     public List<TableMigrationPlan> resolveMigrationPlans(String rootTable,
                                                          String rootIdColumn,
                                                          List<String> explicitTables,
@@ -326,10 +289,6 @@ public class TableDependencyResolver {
         return resolveMigrationPlans(rootTable, rootIdColumn, explicitTables, Collections.emptyList(), excludeTables, shardAll);
     }
 
-    /**
-     * Builds migration plans (SELECT and DELETE queries with foreign key hopping)
-     * for all sharded tables in topological insert order, excluding replica tables.
-     */
     public List<TableMigrationPlan> resolveMigrationPlans(String rootTable,
                                                          String rootIdColumn,
                                                          List<String> explicitTables,
@@ -361,17 +320,12 @@ public class TableDependencyResolver {
             String deleteSql = String.format("DELETE FROM %s WHERE %s = :userId", rootTable, rootIdColumn);
             return new TableMigrationPlan(rootTable, selectSql, deleteSql);
         }
-
-        // Find shortest path from table to rootTable
         List<TableForeignKey> path = findPathToRoot(table, rootTable, allFks);
         if (path.isEmpty()) {
-            // Fallback if no FK path exists: direct filter on rootIdColumn
             String selectSql = String.format("SELECT * FROM %s WHERE %s = :userId", table, rootIdColumn);
             String deleteSql = String.format("DELETE FROM %s WHERE %s = :userId", table, rootIdColumn);
             return new TableMigrationPlan(table, selectSql, deleteSql);
         }
-
-        // Build SELECT query with JOINs
         String selectSql;
         if (path.size() == 1) {
             selectSql = String.format("SELECT * FROM %s WHERE %s = :userId", table, path.get(0).childColumn());
@@ -385,8 +339,6 @@ public class TableDependencyResolver {
             select.append(" WHERE ").append(rootTable).append(".").append(rootIdColumn).append(" = :userId");
             selectSql = select.toString();
         }
-
-        // Build DELETE query with subqueries
         String deleteSql;
         if (path.size() == 1) {
             deleteSql = String.format("DELETE FROM %s WHERE %s = :userId", table, path.get(0).childColumn());

@@ -19,7 +19,6 @@ class EntityTableMetadataResolverTest {
 
     private final EntityTableMetadataResolver resolver = new EntityTableMetadataResolver();
 
-    // 1. Standard hierarchy: Root -> Child -> Grandchild
     @ShardedEntity(root = true)
     static class Organization {
         @ShardedKey
@@ -64,7 +63,6 @@ class EntityTableMetadataResolverTest {
         assertEquals("id", fk2.parentColumn());
     }
 
-    // 2. Explicit table and column names with JPA annotations
     @ShardedEntity(root = true)
     @Table(name = "tenants")
     static class JpaTenant {
@@ -101,7 +99,6 @@ class EntityTableMetadataResolverTest {
         assertEquals("tenant_id", fk.parentColumn());
     }
 
-    // 3. Error Case: Multiple roots
     @ShardedEntity(root = true)
     static class RootA {
         @ShardedKey
@@ -122,7 +119,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Multiple root @ShardedEntity entities found"));
     }
 
-    // 4. Error Case: No root
     @ShardedEntity(root = false)
     static class NoRootChild {
         @ShardedKey(targetEntity = Organization.class)
@@ -137,7 +133,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("No root @ShardedEntity entity found"));
     }
 
-    // 5. Error Case: Cycle detected
     @ShardedEntity(root = true)
     static class CycleRoot {
         @ShardedKey
@@ -164,7 +159,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Cycle detected"));
     }
 
-    // 6. Error Case: Disjoint entity (cannot reach root)
     @ShardedEntity(root = true)
     static class DisjointRoot {
         @ShardedKey
@@ -184,7 +178,6 @@ class EntityTableMetadataResolverTest {
         );
     }
 
-    // 7. Error Case: Missing @ShardedKey on non-root entity
     @ShardedEntity
     static class MissingKeyChild {
         private UUID id;
@@ -198,7 +191,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("has no @ShardedKey annotation"));
     }
 
-    // 8. Error Case: Scalar field missing targetEntity
     @ShardedEntity
     static class MissingTargetEntityChild {
         @ShardedKey
@@ -213,7 +205,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Cannot determine target parent entity"));
     }
 
-    // 9. Root entity with @ShardedStatus
     @ShardedEntity(root = true)
     @Table(name = "accounts")
     static class AccountWithStatus {
@@ -237,7 +228,6 @@ class EntityTableMetadataResolverTest {
         assertNull(result.activeValue());
     }
 
-    // 10. Root entity with explicit @ShardedStatus values
     @ShardedEntity(root = true)
     static class AccountWithCustomStatusValues {
         @ShardedKey
@@ -257,7 +247,6 @@ class EntityTableMetadataResolverTest {
         assertEquals("READY", result.activeValue());
     }
 
-    // 11. Error: multiple @ShardedStatus on root entity
     @ShardedEntity(root = true)
     static class DuplicateStatusEntity {
         @ShardedKey
@@ -278,7 +267,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Multiple @ShardedStatus annotations found"));
     }
 
-    // 12. Error: @ShardedStatus on non-root entity
     @ShardedEntity
     static class NonRootWithStatus {
         @ShardedKey(targetEntity = Organization.class, column = "org_id")
@@ -296,7 +284,6 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("is only permitted on the root entity"));
     }
 
-    // 13. Replicated tables (@ShardedReplica)
     @ShardedReplica(table = "currencies")
     static class Currency {
         private String code;
