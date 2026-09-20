@@ -104,7 +104,7 @@ Fractal intercepts business method execution at the service layer to resolve a s
 - **Virtual Nodes**: Each physical shard is mapped to multiple positions on the ring (`virtualNodes`, default: `150`) using the naming convention `<shardName>-VN-<i>`.
 - **Ring Structure**: Implemented via a `java.util.TreeMap<Long, String>`.
 - **Hashing Function**: Computes an MD5 digest of the input key and maps the first 8 bytes into a 64-bit signed `Long`.
-- **Lookup Complexity**: Binary search traversal via `TreeMap.tailMap(hash)`. If no higher key exists, it wraps around to `ring.firstKey()`.
+- **Lookup Complexity**: Binary search traversal via `TreeMap.tailMap(hash)`. If no higher key exists, io wraps around to `ring.firstKey()`.
 
 ### Sharding Routing DataSource
 
@@ -238,7 +238,7 @@ To guarantee maximum throughput while preserving strict consistency during rebal
   The master root table (e.g. `organizations`) resides on the Primary Database. It acts as the single source of truth for global tenant identity, cross-shard uniqueness enforcement, and cluster-wide migration lifecycle tracking (`ACTIVE` vs. `MIGRATING`). During a rebalance, `RebalanceEngine.setTenantStatus()` and `TopologyManager.isTenantMigrating()` operate directly against this master table on the Primary DB.
 - **Physical Shards (Local Slices for Relational Joins & Foreign Keys)**:
   Each physical shard also provisions the root table schema, populated strictly with the subset of tenants resident on that shard. This ensures that intra-shard relational joins (e.g., `SELECT * FROM projects p JOIN organizations o ON p.org_id = o.org_id`) and database-level foreign key constraints (`ON DELETE CASCADE`) execute natively with zero cross-database query penalties.
-- During rebalancing, `RebalanceEngine` streams the tenant root row along with all child rows from the source shard to the target shard and prunes it from the source shard, while the master record on the Primary Database remains permanently intact.
+- During rebalancing, `RebalanceEngine` streams the tenant root row along with all child rows from the source shard to the target shard and prunes io from the source shard, while the master record on the Primary Database remains permanently intact.
 
 #### 2. Sub-Microsecond Cache-Aside Migration Guard
 Synchronous database round-trips on every service method invocation would bottleneck the Primary DB and introduce unacceptable latency. `TopologyManager` wraps the status check in an optimized [Caffeine](https://github.com/ben-manes/caffeine) cache:
@@ -377,7 +377,7 @@ For each tenant identified in the delta plan:
 
 If the application is stopped, terminated by container orchestration, or crashes due to power outage during migration:
 
-- **Aborted During `COPYING`**: On restart, the source shard remains the intact source of truth. The engine purges any partially inserted records on the target shard and restarts copying from the source. If the copy had completed before the crash, it advances to pruning cleanly.
+- **Aborted During `COPYING`**: On restart, the source shard remains the intact source of truth. The engine purges any partially inserted records on the target shard and restarts copying from the source. If the copy had completed before the crash, io advances to pruning cleanly.
 - **Aborted During `PRUNING`**: On restart, the engine recognizes that the target shard already has all committed tenant data. It avoids duplicate inserts (which would cause unique constraint violations) and directly completes the remaining pruning on the source shard.
 - **Already Completed**: If the tenant data exists exclusively on the target shard (`!sourceHasData && targetHasData`), the engine marks the tenant active and cleans up stale records immediately.
 - **Repetitive Execution**: Re-running the migration engine multiple times produces identical, zero-side-effect results.
@@ -700,7 +700,7 @@ Annotate service methods or classes with `@Sharded` and supply a SpEL expression
 ```java
 package com.example.service;
 
-import it.neko.mukynas.fractal.annotation.Sharded;
+import io.github.mucchinas.fractal.annotation.Sharded;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -759,7 +759,7 @@ Applications can catch this exception via a Spring `@RestControllerAdvice` and r
 ```java
 package com.example.web;
 
-import it.neko.mukynas.fractal.exception.TenantMigratingException;
+import io.github.mucchinas.fractal.exception.TenantMigratingException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -786,7 +786,7 @@ Custom extraction strategies (such as resolving keys from HTTP headers, gRPC met
 package com.example.config;
 
 import jakarta.servlet.http.HttpServletRequest;
-import it.neko.mukynas.fractal.core.ShardingKeyExtractor;
+import io.github.mucchinas.fractal.core.ShardingKeyExtractor;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
@@ -819,7 +819,7 @@ public class HeaderShardingKeyExtractor implements ShardingKeyExtractor {
 - In strict enterprise environments where applications lack DDL privileges at runtime, set `fractal.sharding.primary.initialize-schema: false` and execute the provided DDL script (`src/main/resources/schema-primary.sql`) through your CI/CD database migration pipeline (e.g., Flyway or Liquibase).
 
 #### 2. Business Domain Tables (Physical Shards)
-- Fractal is a database routing and rebalancing starter; by design and industry best practices, it does **not** create or alter business domain tables on physical shards.
+- Fractal is a database routing and rebalancing starter; by design and industry best practices, io does **not** create or alter business domain tables on physical shards.
 - Business tables (such as `orders`, `projects`, `tasks`, and `organizations`) must be provisioned identically across all physical shard databases. In Spring Boot applications, this is typically handled by:
   - **Database Migration Tools (Flyway / Liquibase)**: Configured to execute versioned migrations across all shard datasources.
   - **JPA / Hibernate Schema Generation**: Configured with `spring.jpa.hibernate.ddl-auto=update` or `create` during development.
@@ -961,7 +961,7 @@ When coordinating or aggregating data across multiple datasources (e.g., between
 
 #### The Pitfalls and Dangers of `Propagation.REQUIRES_NEW`
 
-Developers often attempt to bypass this routing lock-in by annotating child service methods with `@Transactional(propagation = Propagation.REQUIRES_NEW)`. While this forces Spring to suspend the outer transaction and obtain a new connection from `ShardingRoutingDataSource` with the shard key active, it introduces severe architectural and operational hazards:
+Developers often attempt to bypass this routing lock-in by annotating child service methods with `@Transactional(propagation = Propagation.REQUIRES_NEW)`. While this forces Spring to suspend the outer transaction and obtain a new connection from `ShardingRoutingDataSource` with the shard key active, io introduces severe architectural and operational hazards:
 
 1. **Atomicity Breakdown & Lack of Distributed Rollback (Partial Failures)**:
    - `Propagation.REQUIRES_NEW` creates completely independent, autonomous physical database transactions.
