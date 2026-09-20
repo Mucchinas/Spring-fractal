@@ -700,7 +700,7 @@ Annotate service methods or classes with `@Sharded` and supply a SpEL expression
 ```java
 package com.example.service;
 
-import neko.mukynas.fractal.annotation.Sharded;
+import it.neko.mukynas.fractal.annotation.Sharded;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -759,7 +759,7 @@ Applications can catch this exception via a Spring `@RestControllerAdvice` and r
 ```java
 package com.example.web;
 
-import neko.mukynas.fractal.exception.TenantMigratingException;
+import it.neko.mukynas.fractal.exception.TenantMigratingException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -786,7 +786,7 @@ Custom extraction strategies (such as resolving keys from HTTP headers, gRPC met
 package com.example.config;
 
 import jakarta.servlet.http.HttpServletRequest;
-import neko.mukynas.fractal.core.ShardingKeyExtractor;
+import it.neko.mukynas.fractal.core.ShardingKeyExtractor;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
