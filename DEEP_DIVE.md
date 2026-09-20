@@ -1444,6 +1444,188 @@ Fractal manages only its internal coordination tables (`fractal_shard_topology`,
 
 ---
 
+### Adopting Fractal on an Already-Populated Monolithic Database (Brownfield Migration)
+
+A common architectural question when introducing Fractal into existing production environments is:
+> *"If all my application tables and rows currently live on a single monolithic database, when does Fractal detect that, and how does it shard the pre-existing data across new shards?"*
+
+#### 1. When Does Fractal Check the Topology?
+
+Fractal checks cluster shard topology **at application startup** via Spring Boot's `CommandLineRunner` lifecycle ([`fractalStartupListener`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/config/FractalAutoConfiguration.java#L156-L278)):
+
+1. **Introspects Coordination State**: It queries the coordination table `fractal_shard_topology` on the `primary` database:
+   ```sql
+   SELECT shard_name FROM fractal_shard_topology;
+   ```
+2. **Detects Discrepancies**: It compares the database records against the shards declared in `application.yml` under `fractal.sharding.shards.*`.
+3. **Triggers Rebalancing**: If any shard declared in YAML is missing from `fractal_shard_topology` (or if there are pending interrupted migrations), Fractal identifies a topology delta (`hasNewShards = true`) and asynchronously triggers the rebalancing engine via `fractalRebalanceExecutor`.
+
+#### 2. How Pre-Existing Monolithic Data is Sharded: The "1-Shard Baseline" Pattern
+
+Fractal's [`RebalanceEngine`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/RebalanceEngine.java) is designed to migrate tenant aggregates **between physical shards** ($N \to M$). The `primary` database acts as the cluster coordinator and master catalog (holding the master tenant list and coordination tables), not a staging dump.
+
+If an application already has all tables and data populated in a single database, **do not** spin up multiple empty shards on Day 1 and expect Fractal to automatically drain your primary database. Instead, use the **1-Shard Baseline Pattern**, the zero-downtime, zero-network-copy industry standard for database sharding:
+
+##### Phase 1: Deploy Fractal with a 1-Shard Baseline (Day 1 - Zero Data Copying)
+
+Declare your **existing populated database as `shard-1`**:
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-monolith:5432/myapp # Points to your existing database
+      username: myapp_admin
+      password: ${DB_PASS}
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-monolith:5432/myapp # Points to the EXACT SAME existing database!
+        username: myapp_admin
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+```
+
+- **What Happens**: On initial startup, Fractal sees that `fractal_shard_topology` is empty and registers `shard-1` as the sole known physical shard.
+- **Immediate Compatibility**: Because `shard-1` is the only node on the consistent hash ring, **100% of routing keys hash to `shard-1`**.
+- **Zero Data Movement**: All existing records already reside on `shard-1`. The application runs immediately with zero downtime, zero data copying over the network, and zero risk. The application is now fully sharding-ready.
+
+##### Phase 2: Scale Horizontally by Adding New Shards ($1 \to N$ Shards)
+
+When the business needs to scale write throughput or storage capacity beyond the single database:
+
+1. **Provision New Database Nodes**: Provision `shard-2` and `shard-3` instances, applying the DDL schema via Flyway or Liquibase.
+2. **Update `application.yml`**:
+   ```yaml
+   fractal:
+     sharding:
+       shards:
+         shard-1:
+           jdbc-url: jdbc:postgresql://db-monolith:5432/myapp # Original database holding 100% of data
+           username: myapp_admin
+           password: ${DB_PASS}
+         shard-2:
+           jdbc-url: jdbc:postgresql://db-shard2:5432/myapp   # New empty database
+           username: myapp_admin
+           password: ${DB_PASS}
+         shard-3:
+           jdbc-url: jdbc:postgresql://db-shard3:5432/myapp   # New empty database
+           username: myapp_admin
+           password: ${DB_PASS}
+       rebalancer:
+         enabled: true
+   ```
+3. **Automated Online Rebalancing**:
+   - On the next startup (or rolling update), `fractalStartupListener` detects `dbShards = [shard-1]` and `yamlShards = [shard-1, shard-2, shard-3]`.
+   - [`MigrationDeltaCalculator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/MigrationDeltaCalculator.java) computes the hash delta:
+     - Old topology (`shard-1`): mapped 100% of tenants to `shard-1`.
+     - New topology (`shard-1, shard-2, shard-3`): balances tenants across all 3 shards (~33% each).
+   - Fractal identifies that only **~66% of tenants** must migrate to `shard-2` and `shard-3`.
+   - The remaining **~33% of tenants never move**: they stay on `shard-1` with zero data copying and zero downtime.
+   - For the moving tenants, [`RebalanceEngine`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/RebalanceEngine.java) migrates them serially (quiescence, topological batch copy, source pruning, and immediate cutover).
+   - Once complete, `shard-1`, `shard-2`, and `shard-3` are marked active, and the cluster operates seamlessly in a 3-shard steady state.
+
+#### 2. Adoption Pathway B: Automated Monolith Evacuation (The Primary Drain Pattern)
+
+If the engineering goal is to maintain the existing database **strictly as a lightweight coordinator** (holding only the master tenant directory, reference data, and coordination tables) and completely evacuate all sharded tables into brand-new shard instances (`shard-1`, `shard-2`, etc.), Fractal provides an automated draining mechanism via `primary.drain: true`.
+
+##### Configuration
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-monolith:5432/myapp # Existing populated monolithic database
+      username: myapp_admin
+      password: ${DB_PASS}
+      drain: true # Instructs Fractal to evacuate all sharded tables to target shards
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-shard1:5432/myapp # Freshly provisioned shard instance
+        username: myapp_admin
+        password: ${DB_PASS}
+      shard-2:
+        jdbc-url: jdbc:postgresql://db-shard2:5432/myapp # Freshly provisioned shard instance
+        username: myapp_admin
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+```
+
+##### Evacuation Lifecycle & Preserved Invariants
+1. **Target Ring Construction**: At boot, [`ConsistentHashRouter`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ConsistentHashRouter.java) creates the active ring using only the declared worker shards (`[shard-1, shard-2]`). `primary` is never treated as a worker shard on the hash ring.
+2. **Dual-Ring In-Flight Routing**: While unmigrated tenants wait for their individual turn, incoming requests route to `primary` via `pendingSourceShards` overrides in [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java).
+3. **Serial Tenant Evacuation**:
+   - For every tenant discovered in `primary`'s `rootTable`, [`RebalanceEngine`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/RebalanceEngine.java) copies the tenant's root record and all sharded child tables (`projects`, `tasks`, etc.) to their assigned target shard (`shard-1` or `shard-2`).
+   - The child tables are **deleted** from `primary`.
+   - The root table record on `primary` is **preserved** and updated to status `ACTIVE`. This maintains `primary`'s catalog integrity for subsequent cluster operations, reference table synchronization, and authentication.
+   - The pending override is cleared, immediately cutting over live traffic for that tenant to the new shard.
+4. **Completion & Idempotency**:
+   - Once all tenants have been migrated off `primary`, [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java) records `primary` with `status = 'DRAINED'` in `fractal_shard_topology`.
+   - On subsequent restarts, Fractal detects that `primary` is already drained and skips re-execution without redundant work.
+
+#### 3. Scaling Down: Graceful Shard Decommissioning ($M \to N$ Shards)
+
+Cluster scale-down (e.g. contracting from 3 shards to 2 shards, or decommissioning an ephemeral maintenance shard) requires safely migrating all tenant records from the retiring shard(s) to the surviving shards without data loss or request errors.
+
+##### The Distributed System Invariant
+In distributed systems, you cannot remove a storage node by simply erasing its credentials from configuration. If `shard-1`'s datasource is removed from `application.yml`, Fractal cannot establish JDBC connections to `shard-1` to read tenant rows, lock in-flight updates, or prune migrated tables.
+
+##### The 3-Step Decommissioning Workflow
+
+###### Step 1: Mark Retiring Shards in Configuration
+Retain the connection pool for the retiring shard in `application.yml`, but mark it with `decommission: true` (or `status: DRAINING`):
+
+```yaml
+fractal:
+  sharding:
+    enabled: true
+    primary:
+      jdbc-url: jdbc:postgresql://db-primary:5432/myapp
+      username: myapp_admin
+      password: ${DB_PASS}
+    shards:
+      shard-1:
+        jdbc-url: jdbc:postgresql://db-shard1:5432/myapp
+        username: myapp_admin
+        password: ${DB_PASS}
+        decommission: true  # Instructs Fractal to safely evacuate this shard
+      shard-2:
+        jdbc-url: jdbc:postgresql://db-shard2:5432/myapp
+        username: myapp_admin
+        password: ${DB_PASS}
+      shard-3:
+        jdbc-url: jdbc:postgresql://db-shard3:5432/myapp
+        username: myapp_admin
+        password: ${DB_PASS}
+    rebalancer:
+      enabled: true
+```
+
+###### Step 2: Automated Drain & Safe Dual-Ring Migration
+On startup (or deployment):
+1. **Contracted Ring Initialization**: [`ConsistentHashRouter`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ConsistentHashRouter.java) initializes the runtime hash ring using **active shards only** (`[shard-2, shard-3]`).
+2. **Datasource Preservation**: [`ShardingRoutingDataSource`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ShardingRoutingDataSource.java) maintains connection pools to all shards (both active and decommissioning).
+3. **Topology Status**: `shard-1` is updated to status `DRAINING` in `fractal_shard_topology`.
+4. **Targeted Delta Calculation**: [`MigrationDeltaCalculator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/MigrationDeltaCalculator.java) calculates the ring delta between `[shard-1, shard-2, shard-3]` and `[shard-2, shard-3]`. It generates migration actions **exclusively for tenants currently located on `shard-1`**. Tenants residing on `shard-2` and `shard-3` remain unaffected.
+5. **Dual-Ring In-Flight Routing**: For every tenant on `shard-1`, a pending source override is registered. While awaiting their turn, incoming tenant queries continue routing to `shard-1`.
+6. **Serial Evacuation**: Tenants on `shard-1` are migrated one-by-one:
+   - Mark `MIGRATING` (in-flight queries drain, incoming writes receive retryable HTTP 503).
+   - Relational tree copied to target shard (`shard-2` or `shard-3`).
+   - Source data pruned from `shard-1`.
+   - Immediate cutover to surviving shard.
+7. **Topology Unregistration**: When all tenants on `shard-1` have migrated and no pending migrations remain, Fractal deletes `shard-1` from `fractal_shard_topology`.
+
+###### Step 3: Physical Teardown
+Once the startup logs display:
+```
+FRACTAL: Shard shard-1 drenato con successo e rimosso dalla topologia.
+```
+The operator can safely turn off the physical database instance for `shard-1` and remove the `shard-1` block from `application.yml` during the next routine deployment.
+
+---
+
 ### Joining Sharded and Non-Sharded Data
 
 Because sharded tables and primary tables reside in different physical database instances and connection pools, single SQL `JOIN` queries cannot be executed across them at the JDBC layer.

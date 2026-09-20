@@ -17,7 +17,7 @@ public class ShardedBroadcastAspect {
     private final Set<String> shardNames;
 
     public ShardedBroadcastAspect(FractalProperties properties) {
-        this.shardNames = properties.getShards() != null ? properties.getShards().keySet() : Set.of();
+        this.shardNames = properties != null ? properties.getActiveShardNames() : Set.of();
     }
 
     public ShardedBroadcastAspect(Set<String> shardNames) {

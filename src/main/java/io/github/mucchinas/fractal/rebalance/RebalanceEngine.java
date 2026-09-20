@@ -48,6 +48,9 @@ public class RebalanceEngine {
         this.dependencyResolver = dependencyResolver;
         this.topologyManager = topologyManager;
         this.props = props != null ? props : new FractalProperties.RebalancerProperties();
+        if (primaryDataSource != null) {
+            this.shardTemplates.put(TopologyManager.PRIMARY_SHARD_NAME, new NamedParameterJdbcTemplate(primaryDataSource));
+        }
     }
 
     public RebalanceEngine(DataSource primaryDataSource,
@@ -129,6 +132,10 @@ public class RebalanceEngine {
                     } else if (TopologyManager.PHASE_PRUNING.equalsIgnoreCase(existingPhase)) {
                         System.out.println("FRACTAL: Ripresa migrazione da fase PRUNING per " + userId);
                         for (TableMigrationPlan plan : deletePlans) {
+                            if (action.sourceShard().equalsIgnoreCase(TopologyManager.PRIMARY_SHARD_NAME)
+                                    && plan.tableName().equalsIgnoreCase(props.getRootTable())) {
+                                continue;
+                            }
                             deleteTableData(userId, plan, source);
                         }
                     } else {
@@ -145,6 +152,10 @@ public class RebalanceEngine {
                             topologyManager.updateMigrationPhase(userId, TopologyManager.PHASE_PRUNING);
                         }
                         for (TableMigrationPlan plan : deletePlans) {
+                            if (action.sourceShard().equalsIgnoreCase(TopologyManager.PRIMARY_SHARD_NAME)
+                                    && plan.tableName().equalsIgnoreCase(props.getRootTable())) {
+                                continue;
+                            }
                             deleteTableData(userId, plan, source);
                         }
                     }

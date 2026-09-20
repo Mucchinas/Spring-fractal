@@ -18,6 +18,7 @@ import io.github.mucchinas.fractal.rebalance.EntityMetadataResult;
 import io.github.mucchinas.fractal.rebalance.EntityTableMetadataResolver;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.context.ApplicationContext;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
@@ -47,7 +48,11 @@ public class FractalAutoConfiguration {
         if (properties.getShards() == null || properties.getShards().isEmpty()) {
             throw new IllegalStateException("Fractal Sharding: No configured shard in application.yml!");
         }
-        return new ConsistentHashRouter(properties.getShards().keySet(), properties.getVirtualNodes());
+        Set<String> activeShards = properties.getActiveShardNames();
+        if (activeShards.isEmpty()) {
+            throw new IllegalStateException("Fractal Sharding: At least one active shard must be configured (all configured shards are marked for decommissioning)!");
+        }
+        return new ConsistentHashRouter(activeShards, properties.getVirtualNodes());
     }
 
     @Bean
@@ -67,6 +72,7 @@ public class FractalAutoConfiguration {
         DataSource primaryDataSource = buildDataSource(properties.getPrimary());
 
         Map<Object, Object> targetDataSources = new HashMap<>();
+        targetDataSources.put(TopologyManager.PRIMARY_SHARD_NAME, primaryDataSource);
         if (properties.getShards() != null) {
             properties.getShards().forEach((name, props) ->
                     targetDataSources.put(name, buildDataSource(props))
@@ -219,18 +225,41 @@ public class FractalAutoConfiguration {
 
             if (properties.getRebalancer().isEnabled()) {
                 topologyManager.initializeSchema();
-                Set<String> yamlShards = properties.getShards().keySet();
+                Set<String> allYamlShards = properties.getShards() != null ? properties.getShards().keySet() : Set.of();
+                Set<String> activeYamlShards = properties.getActiveShardNames();
+                Set<String> decommissionYamlShards = properties.getDecommissioningShardNames();
                 List<String> dbShards = topologyManager.getKnownShardsFromDb();
-                boolean hasNewShards = yamlShards.stream().anyMatch(s -> !dbShards.contains(s));
+
+                List<String> unconfiguredDbShards = dbShards.stream()
+                        .filter(s -> !allYamlShards.contains(s))
+                        .toList();
+                if (!unconfiguredDbShards.isEmpty()) {
+                    System.err.println("FRACTAL: Warning: Detected shards in DB topology (" + unconfiguredDbShards +
+                            ") not present in application.yml. If you intended to decommission a shard, do not delete it from YAML immediately; " +
+                            "mark it with 'decommission: true' so Fractal can safely drain data to surviving shards.");
+                }
+
+                boolean drainPrimary = properties.getPrimary() != null
+                        && properties.getPrimary().isDrain()
+                        && !topologyManager.isPrimaryDrained();
+
+                boolean hasNewShards = activeYamlShards.stream().anyMatch(s -> !dbShards.contains(s));
+                boolean hasDecommissioningShards = decommissionYamlShards.stream().anyMatch(dbShards::contains);
                 List<TopologyManager.PendingMigration> pendingMigrations = topologyManager.getPendingMigrations();
                 boolean hasPending = !pendingMigrations.isEmpty();
 
-                if (hasNewShards || hasPending) {
+                if (drainPrimary || hasNewShards || hasDecommissioningShards || hasPending) {
                     if (hasPending) {
                         System.out.println("FRACTAL: Rilevate " + pendingMigrations.size() + " migrazioni interrotte da completare in modo idempotente.");
                     }
+                    if (drainPrimary) {
+                        System.out.println("FRACTAL: Rilevato primary.drain = true. Avvio evacuazione automatica dei dati dal database primario agli shard attivi!");
+                    }
                     if (hasNewShards) {
                         System.out.println("FRACTAL: Rilevata discrepanza topologia. Nuovi shard aggiunti nello YAML!");
+                    }
+                    if (hasDecommissioningShards) {
+                        System.out.println("FRACTAL: Rilevata decommissione shard. Avvio drenaggio automatico dei nodi in decommission!");
                     }
 
                     fractalRebalanceExecutor.execute(() -> {
@@ -239,31 +268,86 @@ public class FractalAutoConfiguration {
                                 properties.getRebalancer().getLockRefreshInterval())) {
                             try {
                                 if (properties.getRebalancer().getRootTable() == null || properties.getRebalancer().getRootIdColumn() == null) {
-                                    System.out.println("FRACTAL: Rebalancer abilitato ma root-table o root-id-column non configurati. Registrazione shard.");
-                                    yamlShards.forEach(s -> {
+                                    System.out.println("FRACTAL: Rebalancer abilitato ma root-table o root-id-column non configurati. Registrazione topologia.");
+                                    if (drainPrimary) {
+                                        topologyManager.markPrimaryDrained();
+                                    }
+                                    decommissionYamlShards.forEach(topologyManager::removeShard);
+                                    activeYamlShards.forEach(s -> {
                                         topologyManager.registerNewShard(s);
                                         replicaTableSynchronizer.syncAllReplicaTablesToShard(s, properties.getRebalancer().getReplicaTables());
                                     });
                                     return;
                                 }
+
+                                if (drainPrimary) {
+                                    topologyManager.markPrimaryDraining();
+                                }
+
+                                for (String s : decommissionYamlShards) {
+                                    if (dbShards.contains(s)) {
+                                        topologyManager.markShardDraining(s);
+                                    }
+                                }
+
                                 if (!pendingMigrations.isEmpty()) {
                                     List<MigrationDeltaCalculator.MigrationAction> recoveryActions = pendingMigrations.stream()
                                             .map(p -> new MigrationDeltaCalculator.MigrationAction(p.tenantId(), p.sourceShard(), p.targetShard()))
                                             .toList();
                                     rebalanceEngine.executeMigration(recoveryActions);
                                 }
-                                if (hasNewShards) {
+
+                                if (drainPrimary) {
+                                    ConsistentHashRouter activeRouter = new ConsistentHashRouter(activeYamlShards, properties.getVirtualNodes());
+                                    String sql = "SELECT " + properties.getRebalancer().getRootIdColumn() + " FROM " + properties.getRebalancer().getRootTable();
+                                    JdbcTemplate primaryTemplate = new JdbcTemplate(buildDataSource(properties.getPrimary()));
+                                    List<MigrationDeltaCalculator.MigrationAction> primaryDrainActions = new ArrayList<>();
+                                    primaryTemplate.query(sql, rs -> {
+                                        String tenantId = rs.getString(1);
+                                        String targetShard = activeRouter.routeNode(tenantId);
+                                        if (targetShard != null) {
+                                            primaryDrainActions.add(new MigrationDeltaCalculator.MigrationAction(
+                                                    tenantId, TopologyManager.PRIMARY_SHARD_NAME, targetShard));
+                                        }
+                                    });
+
+                                    rebalanceEngine.executeMigration(primaryDrainActions);
+
+                                    if (!topologyManager.hasPendingMigrationsForShard(TopologyManager.PRIMARY_SHARD_NAME)) {
+                                        topologyManager.markPrimaryDrained();
+                                        System.out.println("FRACTAL: Database primario drenato con successo su tutti gli shard attivi.");
+                                    } else {
+                                        System.err.println("FRACTAL: Il database primario presenta ancora migrazioni pendenti, mantenuto in stato DRAINING.");
+                                    }
+
+                                    activeYamlShards.forEach(s -> {
+                                        topologyManager.registerNewShard(s);
+                                        replicaTableSynchronizer.syncAllReplicaTablesToShard(s, properties.getRebalancer().getReplicaTables());
+                                    });
+                                }
+
+                                if (hasNewShards || hasDecommissioningShards) {
                                     MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(
                                             buildDataSource(properties.getPrimary()),
                                             properties.getRebalancer()
                                     );
                                     List<MigrationDeltaCalculator.MigrationAction> actions =
-                                            calculator.calculateDelta(dbShards, yamlShards, properties.getVirtualNodes());
+                                            calculator.calculateDelta(dbShards, activeYamlShards, properties.getVirtualNodes());
                                     rebalanceEngine.executeMigration(actions);
-                                    yamlShards.forEach(s -> {
+
+                                    activeYamlShards.forEach(s -> {
                                         topologyManager.registerNewShard(s);
                                         replicaTableSynchronizer.syncAllReplicaTablesToShard(s, properties.getRebalancer().getReplicaTables());
                                     });
+
+                                    for (String s : decommissionYamlShards) {
+                                        if (!topologyManager.hasPendingMigrationsForShard(s)) {
+                                            topologyManager.removeShard(s);
+                                            System.out.println("FRACTAL: Shard " + s + " drenato con successo e rimosso dalla topologia.");
+                                        } else {
+                                            System.err.println("FRACTAL: Shard " + s + " presenta ancora migrazioni pendenti, mantenuto in stato DRAINING.");
+                                        }
+                                    }
                                 }
                             } catch (Exception e) {
                                 System.err.println("FRACTAL: Errore durante l'esecuzione del rebalancing automatico: " + e.getMessage());

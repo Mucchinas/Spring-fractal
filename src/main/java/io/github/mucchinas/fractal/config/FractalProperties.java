@@ -6,6 +6,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @ConfigurationProperties(prefix = "fractal.sharding")
 public class FractalProperties {
@@ -225,6 +227,26 @@ public class FractalProperties {
         this.shards = shards;
     }
 
+    public Set<String> getActiveShardNames() {
+        if (shards == null || shards.isEmpty()) {
+            return Set.of();
+        }
+        return shards.entrySet().stream()
+                .filter(entry -> entry.getValue() != null && !entry.getValue().isDecommission())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    public Set<String> getDecommissioningShardNames() {
+        if (shards == null || shards.isEmpty()) {
+            return Set.of();
+        }
+        return shards.entrySet().stream()
+                .filter(entry -> entry.getValue() != null && entry.getValue().isDecommission())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
     public boolean getEnabled() {
         return enabled;
     }
@@ -247,6 +269,41 @@ public class FractalProperties {
         private String username;
         private String password;
         private boolean initializeSchema = true;
+        private boolean decommission = false;
+        private boolean drain = false;
+        private String status;
+
+        public boolean isDrain() {
+            return drain || isDecommission();
+        }
+
+        public void setDrain(boolean drain) {
+            this.drain = drain;
+        }
+
+        public boolean isDecommission() {
+            if (decommission) {
+                return true;
+            }
+            if (status != null) {
+                return "DRAINING".equalsIgnoreCase(status)
+                        || "DECOMMISSIONING".equalsIgnoreCase(status)
+                        || "DECOMMISSIONED".equalsIgnoreCase(status);
+            }
+            return false;
+        }
+
+        public void setDecommission(boolean decommission) {
+            this.decommission = decommission;
+        }
+
+        public String getStatus() {
+            return status;
+        }
+
+        public void setStatus(String status) {
+            this.status = status;
+        }
 
         public String getJdbcUrl() {
             return jdbcUrl;

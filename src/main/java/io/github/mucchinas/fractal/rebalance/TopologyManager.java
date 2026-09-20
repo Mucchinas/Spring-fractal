@@ -24,6 +24,10 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     public static final String PHASE_COPYING = "COPYING";
     public static final String PHASE_PRUNING = "PRUNING";
     public static final String GLOBAL_REBALANCE_KEY = "GLOBAL_REBALANCE";
+    public static final String PRIMARY_SHARD_NAME = "primary";
+    public static final String STATUS_ACTIVE = "ACTIVE";
+    public static final String STATUS_DRAINING = "DRAINING";
+    public static final String STATUS_DRAINED = "DRAINED";
 
     private final JdbcTemplate primaryJdbcTemplate;
     private final String instanceId;
@@ -302,7 +306,100 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     public List<String> getKnownShardsFromDb() {
         return primaryJdbcTemplate.queryForList(
-                "SELECT shard_name FROM fractal_shard_topology", String.class);
+                "SELECT shard_name FROM fractal_shard_topology WHERE shard_name != ?", String.class, PRIMARY_SHARD_NAME);
+    }
+
+    public List<String> getActiveShardsFromDb() {
+        return primaryJdbcTemplate.queryForList(
+                "SELECT shard_name FROM fractal_shard_topology WHERE status = 'ACTIVE' AND shard_name != ?", String.class, PRIMARY_SHARD_NAME);
+    }
+
+    public List<String> getDrainingShardsFromDb() {
+        return primaryJdbcTemplate.queryForList(
+                "SELECT shard_name FROM fractal_shard_topology WHERE status = 'DRAINING' AND shard_name != ?", String.class, PRIMARY_SHARD_NAME);
+    }
+
+    public boolean isPrimaryDrained() {
+        try {
+            List<String> statuses = primaryJdbcTemplate.query(
+                    "SELECT status FROM fractal_shard_topology WHERE shard_name = ?",
+                    (rs, rowNum) -> rs.getString(1), PRIMARY_SHARD_NAME);
+            return !statuses.isEmpty() && STATUS_DRAINED.equalsIgnoreCase(statuses.get(0));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public void markPrimaryDraining() {
+        try {
+            List<String> existing = primaryJdbcTemplate.query(
+                    "SELECT shard_name FROM fractal_shard_topology WHERE shard_name = ?",
+                    (rs, rowNum) -> rs.getString(1), PRIMARY_SHARD_NAME);
+            if (existing.isEmpty()) {
+                primaryJdbcTemplate.update(
+                        "INSERT INTO fractal_shard_topology (shard_name, status) VALUES (?, ?)",
+                        PRIMARY_SHARD_NAME, STATUS_DRAINING);
+            } else {
+                primaryJdbcTemplate.update(
+                        "UPDATE fractal_shard_topology SET status = ? WHERE shard_name = ?",
+                        STATUS_DRAINING, PRIMARY_SHARD_NAME);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    public void markPrimaryDrained() {
+        try {
+            List<String> existing = primaryJdbcTemplate.query(
+                    "SELECT shard_name FROM fractal_shard_topology WHERE shard_name = ?",
+                    (rs, rowNum) -> rs.getString(1), PRIMARY_SHARD_NAME);
+            if (existing.isEmpty()) {
+                primaryJdbcTemplate.update(
+                        "INSERT INTO fractal_shard_topology (shard_name, status) VALUES (?, ?)",
+                        PRIMARY_SHARD_NAME, STATUS_DRAINED);
+            } else {
+                primaryJdbcTemplate.update(
+                        "UPDATE fractal_shard_topology SET status = ? WHERE shard_name = ?",
+                        STATUS_DRAINED, PRIMARY_SHARD_NAME);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    public void markShardDraining(String shardName) {
+        if (shardName != null) {
+            try {
+                primaryJdbcTemplate.update(
+                        "UPDATE fractal_shard_topology SET status = 'DRAINING' WHERE shard_name = ?",
+                        shardName
+                );
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public void removeShard(String shardName) {
+        if (shardName != null) {
+            try {
+                primaryJdbcTemplate.update(
+                        "DELETE FROM fractal_shard_topology WHERE shard_name = ?",
+                        shardName
+                );
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    public boolean hasPendingMigrationsForShard(String shardName) {
+        if (shardName == null) return false;
+        try {
+            Integer count = primaryJdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM fractal_tenant_migrations WHERE source_shard = ?",
+                    Integer.class, shardName);
+            return count != null && count > 0;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public void registerNewShard(String shardName) {
@@ -313,6 +410,14 @@ public class TopologyManager implements InitializingBean, DisposableBean {
             try {
                 primaryJdbcTemplate.update(
                         "INSERT INTO fractal_shard_topology (shard_name, status) VALUES (?, 'ACTIVE')",
+                        shardName
+                );
+            } catch (Exception ignored) {
+            }
+        } else {
+            try {
+                primaryJdbcTemplate.update(
+                        "UPDATE fractal_shard_topology SET status = 'ACTIVE' WHERE shard_name = ?",
                         shardName
                 );
             } catch (Exception ignored) {
