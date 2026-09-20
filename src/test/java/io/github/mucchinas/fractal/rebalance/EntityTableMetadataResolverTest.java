@@ -1,13 +1,14 @@
 package io.github.mucchinas.fractal.rebalance;
 
+import io.github.mucchinas.fractal.annotation.ShardedEntity;
+import io.github.mucchinas.fractal.annotation.ShardedKey;
 import io.github.mucchinas.fractal.annotation.ShardedReplica;
+import io.github.mucchinas.fractal.annotation.ShardedRoot;
+import io.github.mucchinas.fractal.annotation.ShardedStatus;
 import jakarta.persistence.Column;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.Table;
-import io.github.mucchinas.fractal.annotation.ShardedEntity;
-import io.github.mucchinas.fractal.annotation.ShardedKey;
-import io.github.mucchinas.fractal.annotation.ShardedStatus;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -19,7 +20,7 @@ class EntityTableMetadataResolverTest {
 
     private final EntityTableMetadataResolver resolver = new EntityTableMetadataResolver();
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class Organization {
         @ShardedKey
         private String id;
@@ -63,7 +64,7 @@ class EntityTableMetadataResolverTest {
         assertEquals("id", fk2.parentColumn());
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     @Table(name = "tenants")
     static class JpaTenant {
         @Id
@@ -99,13 +100,13 @@ class EntityTableMetadataResolverTest {
         assertEquals("tenant_id", fk.parentColumn());
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class RootA {
         @ShardedKey
         private String id;
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class RootB {
         @ShardedKey
         private String id;
@@ -116,10 +117,10 @@ class EntityTableMetadataResolverTest {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
                 resolver.resolveFromClasses(List.of(RootA.class, RootB.class))
         );
-        assertTrue(ex.getMessage().contains("Multiple root @ShardedEntity entities found"));
+        assertTrue(ex.getMessage().contains("Multiple root entities found"));
     }
 
-    @ShardedEntity(root = false)
+    @ShardedEntity
     static class NoRootChild {
         @ShardedKey(targetEntity = Organization.class)
         private String orgId;
@@ -130,10 +131,10 @@ class EntityTableMetadataResolverTest {
         IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
                 resolver.resolveFromClasses(List.of(NoRootChild.class))
         );
-        assertTrue(ex.getMessage().contains("No root @ShardedEntity entity found"));
+        assertTrue(ex.getMessage().contains("No root entity found"));
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class CycleRoot {
         @ShardedKey
         private String id;
@@ -159,7 +160,7 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Cycle detected"));
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class DisjointRoot {
         @ShardedKey
         private String id;
@@ -205,7 +206,7 @@ class EntityTableMetadataResolverTest {
         assertTrue(ex.getMessage().contains("Cannot determine target parent entity"));
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     @Table(name = "accounts")
     static class AccountWithStatus {
         @Id
@@ -228,7 +229,7 @@ class EntityTableMetadataResolverTest {
         assertNull(result.activeValue());
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class AccountWithCustomStatusValues {
         @ShardedKey
         private String id;
@@ -247,7 +248,7 @@ class EntityTableMetadataResolverTest {
         assertEquals("READY", result.activeValue());
     }
 
-    @ShardedEntity(root = true)
+    @ShardedRoot
     static class DuplicateStatusEntity {
         @ShardedKey
         private String id;
@@ -317,5 +318,60 @@ class EntityTableMetadataResolverTest {
         assertNull(result.rootTable());
         assertTrue(result.shardedTables().isEmpty());
         assertEquals(List.of("currencies", "system_roles"), result.replicaTables());
+    }
+
+    @ShardedRoot(table = "custom_roots")
+    static class CustomRootEntity {
+        @ShardedKey(column = "custom_id")
+        private String id;
+    }
+
+    @ShardedEntity
+    static class CustomChildEntity {
+        @ShardedKey
+        private CustomRootEntity root;
+    }
+
+    @Test
+    void shouldResolveRootEntityUsingShardedRootWithCustomTable() {
+        EntityMetadataResult result = resolver.resolveFromClasses(
+                List.of(CustomRootEntity.class, CustomChildEntity.class)
+        );
+
+        assertNotNull(result);
+        assertEquals("custom_roots", result.rootTable());
+        assertEquals("custom_id", result.rootIdColumn());
+        assertEquals(List.of("custom_roots", "custom_child_entity"), result.shardedTables());
+        assertEquals(1, result.foreignKeys().size());
+        assertEquals("custom_child_entity", result.foreignKeys().get(0).childTable());
+        assertEquals("root", result.foreignKeys().get(0).childColumn());
+        assertEquals("custom_roots", result.foreignKeys().get(0).parentTable());
+        assertEquals("custom_id", result.foreignKeys().get(0).parentColumn());
+    }
+
+    @SuppressWarnings("deprecation")
+    @ShardedEntity(root = true, table = "legacy_roots")
+    static class LegacyRootEntity {
+        @ShardedKey
+        private String id;
+    }
+
+    @Test
+    void shouldSupportLegacyShardedEntityWithRootTrue() {
+        EntityMetadataResult result = resolver.resolveFromClasses(
+                List.of(LegacyRootEntity.class)
+        );
+
+        assertNotNull(result);
+        assertEquals("legacy_roots", result.rootTable());
+        assertEquals("id", result.rootIdColumn());
+    }
+
+    @Test
+    void shouldFailWhenBothShardedRootAndLegacyShardedEntityRootTruePresent() {
+        IllegalStateException ex = assertThrows(IllegalStateException.class, () ->
+                resolver.resolveFromClasses(List.of(CustomRootEntity.class, LegacyRootEntity.class))
+        );
+        assertTrue(ex.getMessage().contains("Multiple root entities found"));
     }
 }

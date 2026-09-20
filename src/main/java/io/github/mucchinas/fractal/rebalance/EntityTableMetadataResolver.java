@@ -3,6 +3,7 @@ package io.github.mucchinas.fractal.rebalance;
 import io.github.mucchinas.fractal.annotation.ShardedEntity;
 import io.github.mucchinas.fractal.annotation.ShardedKey;
 import io.github.mucchinas.fractal.annotation.ShardedReplica;
+import io.github.mucchinas.fractal.annotation.ShardedRoot;
 import io.github.mucchinas.fractal.annotation.ShardedStatus;
 import org.springframework.beans.factory.config.BeanDefinition;
 import org.springframework.boot.autoconfigure.AutoConfigurationPackages;
@@ -52,7 +53,7 @@ public class EntityTableMetadataResolver {
         }
 
         List<Class<?>> shardedClasses = classes.stream()
-                .filter(c -> c.isAnnotationPresent(ShardedEntity.class))
+                .filter(c -> c.isAnnotationPresent(ShardedEntity.class) || c.isAnnotationPresent(ShardedRoot.class))
                 .toList();
 
         if (shardedClasses.isEmpty()) {
@@ -64,18 +65,19 @@ public class EntityTableMetadataResolver {
 
         Class<?> rootClass = null;
         for (Class<?> clazz : shardedClasses) {
-            ShardedEntity ann = clazz.getAnnotation(ShardedEntity.class);
-            if (ann.root()) {
+            boolean isRoot = clazz.isAnnotationPresent(ShardedRoot.class) ||
+                    (clazz.isAnnotationPresent(ShardedEntity.class) && clazz.getAnnotation(ShardedEntity.class).root());
+            if (isRoot) {
                 if (rootClass != null) {
-                    throw new IllegalStateException("Multiple root @ShardedEntity entities found: "
-                            + rootClass.getName() + " and " + clazz.getName() + ". Exactly one entity must have root = true.");
+                    throw new IllegalStateException("Multiple root entities found: "
+                            + rootClass.getName() + " and " + clazz.getName() + ". Exactly one entity must be designated as root via @ShardedRoot.");
                 }
                 rootClass = clazz;
             }
         }
 
         if (rootClass == null) {
-            throw new IllegalStateException("No root @ShardedEntity entity found among annotated classes. Exactly one entity must have root = true.");
+            throw new IllegalStateException("No root entity found among annotated classes. Exactly one entity must be designated as root via @ShardedRoot.");
         }
 
         String rootTable = resolveTableName(rootClass);
@@ -101,7 +103,7 @@ public class EntityTableMetadataResolver {
 
             Class<?> targetClass = keyInfo.targetEntity();
             if (targetClass == null || targetClass.equals(Void.class)) {
-                if (keyInfo.type() != null && keyInfo.type().isAnnotationPresent(ShardedEntity.class)) {
+                if (keyInfo.type() != null && (keyInfo.type().isAnnotationPresent(ShardedEntity.class) || keyInfo.type().isAnnotationPresent(ShardedRoot.class))) {
                     targetClass = keyInfo.type();
                 } else {
                     throw new IllegalStateException("Cannot determine target parent entity for @ShardedKey on '"
@@ -111,7 +113,7 @@ public class EntityTableMetadataResolver {
 
             if (!shardedClasses.contains(targetClass)) {
                 throw new IllegalStateException("Target parent entity '" + targetClass.getName()
-                        + "' referenced by '" + clazz.getName() + "' is not an annotated @ShardedEntity.");
+                        + "' referenced by '" + clazz.getName() + "' is not an annotated @ShardedEntity or @ShardedRoot.");
             }
 
             String childTable = tableNames.get(clazz);
@@ -133,7 +135,7 @@ public class EntityTableMetadataResolver {
         for (Class<?> clazz : shardedClasses) {
             if (!clazz.equals(rootClass) && hasShardedStatusAnnotation(clazz)) {
                 throw new IllegalStateException("Entity '" + clazz.getName()
-                        + "' declares @ShardedStatus but is not the root @ShardedEntity. @ShardedStatus is only permitted on the root entity.");
+                        + "' declares @ShardedStatus but is not the root entity. @ShardedStatus is only permitted on the root entity annotated with @ShardedRoot.");
             }
         }
         for (Class<?> clazz : shardedClasses) {
@@ -208,6 +210,10 @@ public class EntityTableMetadataResolver {
     }
 
     public String resolveTableName(Class<?> clazz) {
+        ShardedRoot rootAnn = clazz.getAnnotation(ShardedRoot.class);
+        if (rootAnn != null && !rootAnn.table().isBlank()) {
+            return rootAnn.table().toLowerCase();
+        }
         ShardedEntity ann = clazz.getAnnotation(ShardedEntity.class);
         if (ann != null && !ann.table().isBlank()) {
             return ann.table().toLowerCase();
@@ -406,6 +412,7 @@ public class EntityTableMetadataResolver {
 
         ClassPathScanningCandidateComponentProvider scanner =
                 new ClassPathScanningCandidateComponentProvider(false);
+        scanner.addIncludeFilter(new AnnotationTypeFilter(ShardedRoot.class));
         scanner.addIncludeFilter(new AnnotationTypeFilter(ShardedEntity.class));
         scanner.addIncludeFilter(new AnnotationTypeFilter(ShardedReplica.class));
 

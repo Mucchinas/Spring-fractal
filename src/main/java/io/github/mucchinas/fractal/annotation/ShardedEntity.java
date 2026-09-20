@@ -9,5 +9,9 @@ public @interface ShardedEntity {
 
     String table() default "";
 
+    /**
+     * @deprecated Use {@link ShardedRoot} to designate the root partition entity instead.
+     */
+    @Deprecated
     boolean root() default false;
 }

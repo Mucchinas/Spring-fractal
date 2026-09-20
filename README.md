@@ -132,13 +132,13 @@ public class UserProfileService {
 
 #### Domain Entity Modeling (Zero-Config Rebalancing)
 
-Annotate your domain entities with [`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), and [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java). Fractal automatically infers the root table, partition column, status column, and foreign key dependency graph without requiring any YAML table configuration!
+Annotate your domain entities with [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) (for root partition entities), [`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java) (for child/dependent tables), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), and [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java). Fractal automatically infers the root table, partition column, status column, and foreign key dependency graph without requiring any YAML table configuration!
 
 ```java
 // 1. Root Entity: Defines cluster partition key and migration status
 @Entity
 @Table(name = "organizations")
-@ShardedEntity(root = true)
+@ShardedRoot
 public class Organization {
     @Id
     @ShardedKey

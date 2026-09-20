@@ -4,16 +4,19 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.mucchinas.fractal.annotation.ShardedEntity;
 import io.github.mucchinas.fractal.annotation.ShardedKey;
+import io.github.mucchinas.fractal.annotation.ShardedRoot;
 import io.github.mucchinas.fractal.annotation.ShardedStatus;
 import io.github.mucchinas.fractal.config.FractalProperties;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
 import java.util.Map;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class EntityRebalanceIntegrationTest {
@@ -25,7 +28,7 @@ class EntityRebalanceIntegrationTest {
     private JdbcTemplate shard1Jdbc;
     private JdbcTemplate shard2Jdbc;
 
-    @ShardedEntity(table = "organizations", root = true)
+    @ShardedRoot(table = "organizations")
     static class OrgEntity {
         @ShardedKey(column = "org_id")
         private String orgId;

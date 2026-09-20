@@ -20,7 +20,7 @@ For a quick setup and introductory guide, refer to the [README.md](file:///home/
    - [Distributed Coordination, Locking, & Heartbeat](#distributed-coordination-locking--heartbeat)
    - [High-Performance In-Memory Migration Cache (Caffeine) & Root Catalog Architecture](#high-performance-in-memory-migration-cache-caffeine--root-catalog-architecture)
    - [Topology Delta Calculation Engine](#topology-delta-calculation-engine)
-   - [Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, @ShardedStatus)](#domain-entity-auto-discovery-shardedentity-shardedkey-shardedstatus)
+   - [Domain Entity Auto-Discovery (@ShardedRoot, @ShardedEntity, @ShardedKey, @ShardedStatus)](#domain-entity-auto-discovery-shardedroot-shardedentity-shardedkey-shardedstatus)
    - [Database Catalog Dependency Resolution (ANSI Information Schema)](#database-catalog-dependency-resolution-ansi-information-schema)
    - [Rebalance Execution Lifecycle & Two-Phase State Machine](#rebalance-execution-lifecycle--two-phase-state-machine)
    - [Idempotent Crash Recovery & Resumption Mechanics](#idempotent-crash-recovery--resumption-mechanics)
@@ -397,14 +397,14 @@ It iterates through all tenant identifiers in the master root table on the prima
 
 ---
 
-### Domain Entity Auto-Discovery (@ShardedEntity, @ShardedKey, @ShardedStatus)
+### Domain Entity Auto-Discovery (@ShardedRoot, @ShardedEntity, @ShardedKey, @ShardedStatus)
 
 Fractal provides declarative entity auto-discovery via [`EntityTableMetadataResolver`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/EntityTableMetadataResolver.java):
 
 ```java
 @Entity
 @Table(name = "organizations")
-@ShardedEntity(root = true)
+@ShardedRoot
 public class Organization {
     @Id
     @ShardedKey
@@ -445,7 +445,7 @@ public class Task {
 ```
 
 #### Discovery Mechanics:
-1. **Root Partition Anchor**: Exactly one entity must have `@ShardedEntity(root = true)`. Its `@ShardedKey` field defines `rootTable` and `rootIdColumn`.
+1. **Root Partition Anchor**: Exactly one entity must have [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) (legacy `@ShardedEntity(root = true)` is also supported for backward compatibility). Its `@ShardedKey` field defines `rootTable` and `rootIdColumn`.
 2. **Foreign Key Hopping**: Descendant entities specify `@ShardedKey` on entity references (`@ManyToOne`) or scalar fields (`targetEntity = ...`).
 3. **Status Column Discovery**: `@ShardedStatus` designates the tenant status column on the root entity. Column names and values (`migratingValue`, `activeValue`) are inferred from JPA `@Column` or annotations.
 4. **Physical FK Independence**: The entity dependency graph is constructed directly from Java annotations. This enables topological rebalancing even on database clusters where physical foreign key constraints have been omitted for write performance.
@@ -562,7 +562,7 @@ If an application instance terminates mid-migration (SIGKILL, container preempti
 
 | Architecture Profile | Sharding Key Source | Entity Discovery Strategy | Rebalancing & Migrations | Replica & Reference Tables | Ideal For |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Profile 1: B2B Multi-Tenant SaaS** | JWT Security Claim (`tenant_id`, `org_id`) | Domain Annotations ([`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java)) | Automated Rebalancer (`enabled: true`, zero-config) | [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) + [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) for lookup tables | Multi-tenant SaaS with authenticated enterprise tenants |
+| **Profile 1: B2B Multi-Tenant SaaS** | JWT Security Claim (`tenant_id`, `org_id`) | Domain Annotations ([`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java), [`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java)) | Automated Rebalancer (`enabled: true`, zero-config) | [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) + [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) for lookup tables | Multi-tenant SaaS with authenticated enterprise tenants |
 | **Profile 2: High-Throughput User / Account Partitioning** | Service Method SpEL (`#userId`, `#accountId`) | Domain Annotations or Database Catalog | Automated Rebalancer (`enabled: true`) | Replicated reference tables (`currencies`, `tiers`) | B2C E-Commerce, FinTech, social feeds, gaming platforms |
 | **Profile 3: Turnkey Legacy Catalog Sharding** | JWT or Method SpEL | Database Catalog Introspection (`shard-all: true`) | Automated Rebalancer (`enabled: true`, topological sort) | Unconnected tables auto-replicated to all shards | Existing relational databases with established foreign key constraints |
 | **Profile 4: Read-Mostly Reference Replication** | JWT or Method SpEL | Domain Entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) | Optional | Startup sync via [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java) + parallel [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) | Global reference catalogs requiring local shard joins |
@@ -606,7 +606,7 @@ fractal:
   ```java
   @Entity
   @Table(name = "organizations")
-  @ShardedEntity(root = true)
+  @ShardedRoot
   public class Organization {
       @Id @ShardedKey private String id;
       @ShardedStatus private String status;
@@ -811,7 +811,7 @@ All properties are rooted under `fractal.sharding`:
 | `fractal.sharding.shards.<name>.username` | `String` | - | Database username for physical shard `<name>`. |
 | `fractal.sharding.shards.<name>.password` | `String` | - | Database password for physical shard `<name>`. |
 | `fractal.sharding.rebalancer.enabled` | `boolean` | `false` | Enables the automatic migration listener on startup. |
-| `fractal.sharding.rebalancer.shard-all` | `boolean` | `false` | When `true`, automatically shards all database tables (catalog discovery) except excluded tables, ignoring `@ShardedEntity`. |
+| `fractal.sharding.rebalancer.shard-all` | `boolean` | `false` | When `true`, automatically shards all database tables (catalog discovery) except excluded tables, ignoring `@ShardedRoot` and `@ShardedEntity`. |
 | `fractal.sharding.rebalancer.lock-timeout` | `Duration` | `15m` | Maximum lock expiration duration before an unreleased lock is considered dead and eligible for atomic takeover. |
 | `fractal.sharding.rebalancer.lock-refresh-interval` | `Duration` | `1m` | Periodic heartbeat interval for renewing `locked_at` during an active rebalance migration. |
 | `fractal.sharding.rebalancer.drain-timeout` | `Duration` | `10s` | Maximum duration to wait for pre-existing local in-flight transactions for a tenant to drain to 0 before deferring migration. Enforces minimum of `5s`. |
@@ -820,12 +820,12 @@ All properties are rooted under `fractal.sharding`:
 | `fractal.sharding.rebalancer.status-cache-max-size` | `long` | `50000` | Maximum number of tenant status entries cached in local memory (< 2MB RAM). |
 | `fractal.sharding.rebalancer.batch-size` | `int` | `500` | Target chunk size for batch inserts during data copying and replica synchronization. |
 | `fractal.sharding.rebalancer.max-batch-parameters` | `int` | `32766` | Maximum total JDBC bind parameters per chunk ($batchSize \times columns \le maxParameters$) to prevent parameter overflow errors (e.g. Postgres 65,535). |
-| `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedEntity(root = true)` if omitted. |
+| `fractal.sharding.rebalancer.root-table` | `String` | - | Master table holding tenant/entity records (e.g., `organizations`). Inferred from `@ShardedRoot` (or legacy `@ShardedEntity(root = true)`) if omitted. |
 | `fractal.sharding.rebalancer.root-id-column` | `String` | - | Partition column name (e.g., `org_id`). Inferred from root `@ShardedKey` or `@Id` if omitted. |
 | `fractal.sharding.rebalancer.status-column` | `String` | - | Column on `rootTable` indicating migration state. Inferred from root `@ShardedStatus` if omitted. |
 | `fractal.sharding.rebalancer.migrating-value` | `String` | `MIGRATING` | State string set during an in-flight migration. Inferred from `@ShardedStatus(migratingValue = ...)` if omitted. |
 | `fractal.sharding.rebalancer.active-value` | `String` | `ACTIVE` | State string when tenant is available. Inferred from `@ShardedStatus(activeValue = ...)` if omitted. |
-| `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedEntity` domain models or foreign key graph. |
+| `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedRoot` / `@ShardedEntity` domain models or foreign key graph. |
 | `fractal.sharding.rebalancer.replica-tables` | `List<String>` | `null` | Optional explicit list of reference tables to replicate across all shards. Inferred from `@ShardedReplica` or catalog when `shard-all: true`. |
 | `fractal.sharding.rebalancer.exclude-tables` | `List<String>` | `null` | Optional list of tables to exclude from auto-discovery. |
 
@@ -860,7 +860,7 @@ fractal:
         password: ${SHARD_US1_PASSWORD}
     rebalancer:
       enabled: true
-      shard-all: false            # If true, auto-shards catalog; if false, uses @ShardedEntity
+      shard-all: false            # If true, auto-shards catalog; if false, uses @ShardedRoot / @ShardedEntity
       lock-timeout: 15m           # Lock takeover threshold for dead node recovery
       lock-refresh-interval: 1m   # Heartbeat daemon interval to renew lock
       drain-timeout: 10s          # Timeout to drain local in-flight transactions (min 5s)
@@ -869,7 +869,7 @@ fractal:
       status-cache-max-size: 50000# Max entries in Caffeine cache
       batch-size: 500             # Rows per batch insert chunk
       max-batch-parameters: 32766 # Max bind parameters per chunk
-      # When using @ShardedEntity, @ShardedKey, and @ShardedStatus, the properties below
+      # When using @ShardedRoot, @ShardedEntity, @ShardedKey, and @ShardedStatus, the properties below
       # are auto-discovered and do not need to be specified:
       # root-table: organizations
       # root-id-column: id
@@ -1136,7 +1136,7 @@ The test suite validates the starter across 16 test classes covering 59 automate
 - `ShardingAspectMigrationLockTest`: Asserts that `TenantMigratingException` is thrown when accessing a tenant currently migrating.
 - `TopologyManagerCaffeineCacheTest`: Validates sub-microsecond Caffeine caching, zero DB queries within TTL, cache invalidation on status updates, and automatic reload on TTL expiration.
 - `TableDependencyResolverTest`: Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution, Kahn's topological sort for insert/delete ordering, join query synthesis, table exclusion, and replica table isolation.
-- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedEntity`, `@ShardedKey`, `@ShardedStatus`, and `@ShardedReplica`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
+- `EntityTableMetadataResolverTest`: Validates domain entity auto-discovery via `@ShardedRoot`, `@ShardedEntity`, `@ShardedKey`, `@ShardedStatus`, and `@ShardedReplica`, multi-tier hierarchy resolution, JPA `@Table`/`@JoinColumn`/`@Column`/`@Id` metadata extraction, custom status values, cycle detection, reachability checks, single-root enforcement, duplicate status prevention, and non-root status prohibition.
 - `EntityRebalanceIntegrationTest`: Confirms end-to-end multi-hop tenant migration on physical databases without database foreign key constraints using entity-discovered plans and `@ShardedStatus`, while ensuring replicated tables (`currencies`) are preserved on all shards.
 - `RebalanceEngineTest`: Validates end-to-end tenant migration, row copying across shards using multi-hop plans, and reverse-order row pruning.
 - `ReplicaTableSynchronizerTest`: Tests batch synchronization of reference tables from primary coordinator to shards and new shard catch-up.
