@@ -72,23 +72,31 @@ public class ShardingAspect {
         TopologyManager topologyManager = topologyManagerProvider != null ? topologyManagerProvider.getIfAvailable() : null;
         FractalProperties properties = propertiesProvider != null ? propertiesProvider.getIfAvailable() : null;
 
-        if (topologyManager != null) {
-            topologyManager.registerRequestStart(shardingKey);
+        boolean rebalanceActive = topologyManager != null && properties != null
+                && properties.getRebalancer().isEnabled()
+                && topologyManager.isRebalanceActive();
+
+        if (!rebalanceActive) {
+            String targetShard = router.routeNode(shardingKey);
+            ShardContextHolder.setShard(targetShard);
+            try {
+                return joinPoint.proceed();
+            } finally {
+                ShardContextHolder.clear();
+            }
         }
 
+        topologyManager.registerRequestStart(shardingKey);
         try {
-            if (topologyManager != null && properties != null && properties.getRebalancer().isEnabled()) {
-                if (topologyManager.isTenantMigrating(shardingKey, properties.getRebalancer())) {
-                    throw new TenantMigratingException(shardingKey);
-                }
+            if (topologyManager.isTenantMigrating(shardingKey, properties.getRebalancer())) {
+                throw new TenantMigratingException(shardingKey);
             }
-            String targetShard = router.routeNode(shardingKey);
+            String sourceOverride = topologyManager.getPendingSourceShard(shardingKey);
+            String targetShard = (sourceOverride != null) ? sourceOverride : router.routeNode(shardingKey);
             ShardContextHolder.setShard(targetShard);
             return joinPoint.proceed();
         } finally {
-            if (topologyManager != null) {
-                topologyManager.registerRequestEnd(shardingKey);
-            }
+            topologyManager.registerRequestEnd(shardingKey);
             ShardContextHolder.clear();
         }
     }

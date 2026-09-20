@@ -13,14 +13,17 @@ import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
 
 public class TopologyManager implements InitializingBean, DisposableBean {
 
     public static final String REBALANCE_LOCK = "REBALANCE_LOCK";
+    public static final String PHASE_PENDING = "PENDING";
     public static final String PHASE_COPYING = "COPYING";
     public static final String PHASE_PRUNING = "PRUNING";
+    public static final String GLOBAL_REBALANCE_KEY = "GLOBAL_REBALANCE";
 
     private final JdbcTemplate primaryJdbcTemplate;
     private final String instanceId;
@@ -28,6 +31,9 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     private final Set<String> activeMigratingTenants = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, java.util.concurrent.atomic.LongAdder> inFlightRequests = new ConcurrentHashMap<>();
     private final Cache<String, Boolean> migrationStatusCache;
+    private final ConcurrentMap<String, String> pendingSourceShards = new ConcurrentHashMap<>();
+    private final Cache<String, Boolean> rebalanceActiveCache;
+    private volatile boolean rebalanceActive = false;
 
     private final ScheduledExecutorService heartbeatExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "fractal-lock-heartbeat");
@@ -56,6 +62,10 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                 .maximumSize(maxSize)
                 .expireAfterWrite(ttl)
                 .build();
+        this.rebalanceActiveCache = Caffeine.newBuilder()
+                .maximumSize(1)
+                .expireAfterWrite(ttl)
+                .build();
     }
 
     @Override
@@ -75,6 +85,99 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     public Cache<String, Boolean> getMigrationStatusCache() {
         return migrationStatusCache;
+    }
+
+    public Cache<String, Boolean> getRebalanceActiveCache() {
+        return rebalanceActiveCache;
+    }
+
+    public boolean isRebalanceActive() {
+        if (rebalanceActive || !activeMigratingTenants.isEmpty() || !pendingSourceShards.isEmpty()) {
+            return true;
+        }
+        return Boolean.TRUE.equals(rebalanceActiveCache.get(GLOBAL_REBALANCE_KEY, k -> checkGlobalRebalanceInDb()));
+    }
+
+    private boolean checkGlobalRebalanceInDb() {
+        try {
+            Timestamp validThreshold = Timestamp.from(Instant.now().minus(Duration.ofMinutes(15)));
+            List<String> locks = primaryJdbcTemplate.query(
+                    "SELECT locked_by FROM fractal_locks WHERE lock_name = ? AND locked_at > ?",
+                    (rs, rowNum) -> rs.getString(1), REBALANCE_LOCK, validThreshold);
+            if (!locks.isEmpty()) {
+                return true;
+            }
+            Integer count = primaryJdbcTemplate.queryForObject(
+                    "SELECT COUNT(*) FROM fractal_tenant_migrations", Integer.class);
+            return count != null && count > 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public void setRebalanceActive(boolean active) {
+        this.rebalanceActive = active;
+        rebalanceActiveCache.put(GLOBAL_REBALANCE_KEY, active);
+        if (!active) {
+            activeMigratingTenants.clear();
+            pendingSourceShards.clear();
+            migrationStatusCache.invalidateAll();
+        }
+    }
+
+    public void clearActiveMigratingTenants() {
+        activeMigratingTenants.clear();
+    }
+
+    public void registerPendingMigration(String tenantId, String sourceShard) {
+        if (tenantId != null && sourceShard != null) {
+            pendingSourceShards.put(tenantId, sourceShard);
+            setRebalanceActive(true);
+        }
+    }
+
+    public void registerPendingMigrations(Map<String, String> overrides) {
+        if (overrides != null && !overrides.isEmpty()) {
+            pendingSourceShards.putAll(overrides);
+            setRebalanceActive(true);
+        }
+    }
+
+    public String getPendingSourceShard(String tenantId) {
+        if (tenantId == null) {
+            return null;
+        }
+        return pendingSourceShards.get(tenantId);
+    }
+
+    public void completePendingMigration(String tenantId) {
+        if (tenantId != null) {
+            pendingSourceShards.remove(tenantId);
+            clearMigrationRecord(tenantId);
+        }
+    }
+
+    public void clearPendingMigrations() {
+        pendingSourceShards.clear();
+    }
+
+    public void recordPendingMigration(String tenantId, String sourceShard, String targetShard) {
+        try {
+            List<String> existingPhases = primaryJdbcTemplate.query(
+                    "SELECT phase FROM fractal_tenant_migrations WHERE tenant_id = ?",
+                    (rs, rowNum) -> rs.getString(1), tenantId);
+            if (existingPhases.isEmpty()) {
+                registerPendingMigration(tenantId, sourceShard);
+                primaryJdbcTemplate.update("""
+                    INSERT INTO fractal_tenant_migrations (tenant_id, source_shard, target_shard, phase, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, tenantId, sourceShard, targetShard, PHASE_PENDING, Timestamp.from(Instant.now()));
+            } else if (PHASE_PENDING.equalsIgnoreCase(existingPhases.get(0))) {
+                registerPendingMigration(tenantId, sourceShard);
+            }
+        } catch (Exception ignored) {
+            registerPendingMigration(tenantId, sourceShard);
+        }
     }
 
     public void markTenantMigrating(String tenantId) {
@@ -230,6 +333,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
             );
             if (inserted > 0) {
                 lockHeld = true;
+                setRebalanceActive(true);
                 startHeartbeat(lockRefreshInterval);
                 return true;
             }
@@ -246,6 +350,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
         if (updated > 0) {
             lockHeld = true;
+            setRebalanceActive(true);
             startHeartbeat(lockRefreshInterval);
             return true;
         }
@@ -264,6 +369,8 @@ public class TopologyManager implements InitializingBean, DisposableBean {
             System.err.println("FRACTAL: Error releasing rebalance lock: " + e.getMessage());
         } finally {
             lockHeld = false;
+            setRebalanceActive(false);
+            clearPendingMigrations();
         }
     }
 

@@ -366,11 +366,91 @@ Checking whether a tenant is actively migrating on every HTTP or service invocat
    - Enables native relational joins (e.g. `SELECT * FROM projects p JOIN organizations o ON p.org_id = o.id`) and database-level foreign key cascades directly on the shard.
 3. During rebalancing, [`RebalanceEngine`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/RebalanceEngine.java) streams the tenant root row along with all descendant rows from the source shard to the target shard and removes io from the source shard, while the master record on the Primary Database remains permanently intact.
 
+#### Dynamic Dual-Ring Migration Routing & Zero-Overhead Normal Operations
+
+A critical challenge in online shard rebalancing is routing incoming traffic correctly while the cluster transitions from $N$ to $M$ shards:
+- Some tenants have not yet migrated and still reside on their old shard ($R_{old}$).
+- One tenant is actively migrating (rows in flight between shards).
+- Some tenants have already migrated and now reside on their new shard ($R_{new}$).
+- Most tenants were not affected by the rebalance and remain on their current shard ($R_{old} = R_{new}$).
+
+Fractal achieves this with **Dynamic Dual-Ring Routing** and **Zero-Overhead Steady-State Operations**:
+
+```
+                                  [Incoming Request]
+                                           |
+                                           v
+                          +----------------------------------+
+                          |  TopologyManager:                |
+                          |  isRebalanceActive()?            |
+                          +----------------+-----------------+
+                                           |
+                  +------------------------+------------------------+
+                  | (FALSE: Steady-State)                           | (TRUE: Rebalancing Active)
+                  v                                                 v
+   +------------------------------+                  +------------------------------+
+   | FAST PATH (Zero-Overhead):   |                  | Track In-Flight Requests     |
+   | - Bypass per-tenant cache    |                  | LongAdder.increment()        |
+   | - Bypass DB queries          |                  +--------------+---------------+
+   | - Bypass LongAdder tracking  |                                 |
+   | Route directly via R_new     |                                 v
+   +--------------+---------------+                  +------------------------------+
+                  |                                  | Is Tenant Actively           |
+                  |                                  | Migrating?                   |
+                  |                                  +--------------+---------------+
+                  |                                                 |
+                  |                        +------------------------+------------------------+
+                  |                        | (YES)                                           | (NO)
+                  |                        v                                                 v
+                  |         +------------------------------+                  +------------------------------+
+                  |         | THROW TenantMigratingException|                  | Has Pending Source           |
+                  |         | (HTTP 503 Retry-After)       |                  | Override in TopologyManager? |
+                  |         +------------------------------+                  +--------------+---------------+
+                  |                                                                          |
+                  |                                                 +------------------------+------------------------+
+                  |                                                 | (YES: Unmigrated)      | (NO: Migrated/Bystander)
+                  |                                                 v                        v
+                  |                                  +------------------------------+ +------------------------------+
+                  |                                  | Route to Old Source Shard    | | Route to New Ring Shard      |
+                  |                                  | (R_old Override)             | | (R_new)                      |
+                  |                                  +--------------+---------------+ +--------------+---------------+
+                  |                                                 |                                |
+                  +-------------------------------------------------+--------------------------------+
+                                                                    |
+                                                                    v
+                                                     [Execute on Target Shard]
+```
+
+##### 1. Zero-Overhead Normal Operations (Steady-State Fast Path)
+
+In production, rebalancing is an occasional operational event (e.g. executed once a month or quarter when scaling shards). Under steady-state operations:
+- [`TopologyManager.isRebalanceActive()`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java#L94) consults a dedicated, 1-element [Caffeine](https://github.com/ben-manes/caffeine) cache (`rebalanceActiveCache`, TTL `status-cache-ttl`, default: `2s`).
+- When `false`, [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) immediately invokes `router.routeNode(shardingKey)` and proceeds.
+- **Zero Cache Misses**: The per-tenant `migrationStatusCache` is neither queried nor populated.
+- **Zero Lock Contention**: `LongAdder` in-flight request tracking is skipped entirely.
+- Normal request overhead is identical to standard consistent hashing without rebalancing capability (~15 nanoseconds).
+
+##### 2. Dynamic Routing Lifecycle During Active Rebalance
+
+When physical shards are added, the rebalance runner acquires `REBALANCE_LOCK` and begins migration:
+
+1. **Global Activation**: `isRebalanceActive` becomes `true` locally and propagates across cluster pods via `rebalanceActiveCache`.
+2. **Pending Overrides ($R_{old}$)**: All relocation actions calculated by [`MigrationDeltaCalculator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/MigrationDeltaCalculator.java) are registered in [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java) via `registerPendingMigration(tenantId, sourceShard)` and written to `fractal_tenant_migrations` as `PENDING`. Requests for pending tenants continue routing to their **old source shard**.
+3. **Per-Tenant Serial Migration**: Tenants are migrated one by one:
+   - **Isolation**: Tenant status is set to `MIGRATING`. In-flight requests drain. New requests immediately receive [`TenantMigratingException`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/exception/TenantMigratingException.java).
+   - **Data Transfer**: Tables are copied topologically to the new shard and pruned from the old shard.
+4. **Immediate Cutover ($R_{new}$)**: As soon as an individual tenant's data transfer completes:
+   - Its pending override is removed (`completePendingMigration(tenantId)`).
+   - Its status is set back to `ACTIVE`.
+   - Subsequent requests for this tenant **immediately route to the new shard ($R_{new}$)**. The tenant does NOT wait for the remaining batch to finish.
+5. **Non-Migrating Tenants (Bystanders)**: Tenants that do not change shards have no pending override ($R_{old} = R_{new}$). They continue routing to their existing shard throughout the entire rebalancing process with zero downtime.
+6. **Rebalance Completion**: Once all actions finish and `releaseRebalanceLock()` is invoked, `isRebalanceActive` resets to `false`, clearing all pending maps and per-tenant caches, seamlessly returning the cluster to zero-overhead mode.
+
 #### Sub-Microsecond Cache-Aside Migration Guard
 
 [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java) caches tenant migration statuses using [Caffeine](https://github.com/ben-manes/caffeine):
 
-- **Fast Path (~15 Nanoseconds)**: Service methods check `TopologyManager.isTenantMigrating(tenantId)` directly in JVM heap memory with zero network or JDBC overhead.
+- **Fast Path (~15 Nanoseconds)**: Service methods check `TopologyManager.isTenantMigrating(tenantId)` directly in JVM heap memory with zero network or JDBC overhead during rebalancing.
 - **Slow Path (Authoritative Lookup)**: On a cache miss or TTL expiration (`status-cache-ttl`, default: `2s`), Fractal queries `fractal_tenant_migrations` and the master root table on the Primary DB.
 - **Proactive Local Cache Priming**:
   - `markTenantMigrating(id)`: Immediately writes `true` to local cache.
@@ -402,6 +482,7 @@ It iterates through all tenant identifiers in the master root table on the prima
 Fractal provides declarative entity auto-discovery via [`EntityTableMetadataResolver`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/EntityTableMetadataResolver.java):
 
 ```java
+// 1. Root Partition Entity: Defines cluster partition key and migration status
 @Entity
 @Table(name = "organizations")
 @ShardedRoot
@@ -417,6 +498,7 @@ public class Organization {
     private String syncStatus;
 }
 
+// 2. Child Entity (JPA Object Reference): References root entity directly
 @Entity
 @Table(name = "projects")
 @ShardedEntity
@@ -424,13 +506,15 @@ public class Project {
     @Id
     private UUID id;
 
-    // Direct object reference: target entity inferred as Organization
+    // Target entity inferred from Organization field type
+    // Foreign key column inferred from @JoinColumn name ("org_id")
     @ShardedKey
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "org_id")
     private Organization organization;
 }
 
+// 3. Leaf Entity (Scalar Foreign Key): Uses scalar UUID instead of JPA entity reference
 @Entity
 @Table(name = "tasks")
 @ShardedEntity
@@ -438,13 +522,142 @@ public class Task {
     @Id
     private UUID id;
 
-    // Scalar foreign key: points explicitly to Project
-    @ShardedKey(targetEntity = Project.class, column = "project_id")
+    // Best practice for scalar IDs: specify targetEntity = Project.class.
+    // The foreign key column in tasks ("project_id") is inferred from @Column(name) or field name.
+    @Column(name = "project_id")
+    @ShardedKey(targetEntity = Project.class)
     private UUID projectId;
 }
 ```
 
-#### Discovery Mechanics:
+#### Understanding the Foreign Key "Hop" Mechanism
+
+In horizontal sharding, only the root entity ([`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java)) stores the primary partition key (`Organization.id = "org_1"`). Descendant tables (e.g. `tasks`) rarely have an `org_id` column; they only know their immediate parent (`projects.id`).
+
+When the automated rebalancer migrates a tenant to a new physical shard, it must copy all associated data across the entire entity hierarchy. To achieve this without requiring database-level foreign key constraints, Fractal builds a Directed Acyclic Graph (DAG) of entities and navigates backwards from leaf tables to the root using multi-hop SQL joins.
+
+#### Scalar IDs (UUID / Long) vs. JPA Object References
+
+In modern Spring Boot and Domain-Driven Design (DDD) architectures, developers frequently prefer scalar foreign keys (`UUID projectId`) rather than full JPA entity relationships (`@ManyToOne Project project`) for several architectural reasons:
+- **Clean Aggregate Boundaries**: In DDD, aggregate roots reference other aggregate roots by identity (scalar ID), not by direct object reference.
+- **Elimination of Lazy Loading & N+1 Queries**: Prevents unintentional queries triggered by accessing entity relationships outside of active transactions.
+- **Zero Hibernate Proxy Serialization Issues**: Avoids Jackson/DTO serialization errors caused by uninitialized Hibernate ByteBuddy proxies.
+
+However, scalar types introduce a metadata challenge for reflection:
+1. **With JPA Object References (`@ManyToOne Organization organization`)**: Java reflection inspects `field.getType()`, which yields `Organization.class`. Fractal immediately knows the parent entity, its table name, and extracts the foreign key column from `@JoinColumn(name = "org_id")`.
+2. **With Scalar IDs (`UUID projectId`)**: Java reflection only sees `java.util.UUID.class`. `UUID` carries zero semantic information about which entity or table it references. Fractal cannot infer whether `projectId` points to `Project`, `Organization`, or `User`.
+
+This is why `targetEntity` is **mandatory** on scalar fields:
+```java
+@ShardedKey(targetEntity = Project.class)
+private UUID projectId;
+```
+
+#### Deconstructing `@ShardedKey` Attributes: Which Column Goes Where
+
+The [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java) annotation contains three attributes. It is crucial to understand which table and column each attribute refers to:
+
+| Attribute | Table Scope | Purpose | Required for Scalar UUID? | Required for `@ManyToOne`? | Default / Inference Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `targetEntity` | **Parent Table** | Specifies the parent entity class in the DAG | **Yes** (`Project.class`) | No | Inferred from Java field type (e.g. `Organization.class`) |
+| `column` | **This Entity's Table** (Child) | The foreign key column in **this** table pointing to the parent | No (Optional) | No (Optional) | Inferred from `@Column(name)`, `@JoinColumn(name)`, or field name in `snake_case` (`project_id`) |
+| `referencedColumn` | **Parent Table** | The column in the **parent** table being referenced | No (Optional) | No (Optional) | Inferred from parent's `@Id` primary key (or root partition key if `@ShardedRoot`) |
+
+##### Clarification on `column`:
+- `column` specifies the column in **this entity's table** (child table), NOT the parent table.
+- If you annotate the field with standard JPA `@Column(name = "project_id")`, or if your Java field name is `projectId` (which converts to `project_id` via snake_case), you **do not need** to specify `column` in `@ShardedKey`.
+- Only use `column = "custom_fk_col"` if your physical database column name cannot be determined from `@Column` or field name conventions.
+
+##### Clarification on `referencedColumn`:
+- `referencedColumn` specifies the column in the **parent entity's table**.
+- By default, Fractal automatically inspects the `targetEntity` class and uses its `@Id` primary key column (e.g. `projects.id`).
+- You only need to specify `referencedColumn = "..."` in rare schemas where a foreign key references a unique column other than the parent's primary key.
+
+#### How Fractal Synthesizes the Hop SQL During Migrations
+
+When moving an organization (`'org_123'`) from Shard A to Shard B, [`TableDependencyResolver`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TableDependencyResolver.java) traces the path from each table to the root and generates the exact migration queries:
+
+```sql
+-- 1. Hop 0: Root Entity (organizations)
+SELECT * FROM organizations WHERE id = 'org_123';
+
+-- 2. Hop 1: Child Entity (projects - 1 hop to root via org_id)
+SELECT * FROM projects WHERE org_id = 'org_123';
+
+-- 3. Hop 2: Leaf Entity (tasks - 2 hops to root via tasks.project_id -> projects.id -> projects.org_id)
+SELECT tasks.* FROM tasks
+JOIN projects ON tasks.project_id = projects.id
+JOIN organizations ON projects.org_id = organizations.id
+WHERE organizations.id = 'org_123';
+```
+
+During the pruning phase, Fractal executes reverse-dependency deletions to satisfy database constraints:
+```sql
+-- Reverse order pruning on source shard:
+DELETE FROM tasks WHERE project_id IN (
+    SELECT id FROM projects WHERE org_id = 'org_123'
+);
+DELETE FROM projects WHERE org_id = 'org_123';
+DELETE FROM organizations WHERE id = 'org_123';
+```
+
+#### Best Practice Guidelines for Entity Modeling
+
+##### Guideline 1: Scalar Foreign Keys (Recommended for DDD and High-Throughput Services)
+Combine standard JPA `@Column` with `@ShardedKey(targetEntity = ...)`:
+```java
+@Entity
+@Table(name = "tasks")
+@ShardedEntity
+public class Task {
+    @Id
+    private UUID id;
+
+    // Clean, idiomatic JPA: no column duplication
+    @Column(name = "project_id")
+    @ShardedKey(targetEntity = Project.class)
+    private UUID projectId;
+}
+```
+- **Why**: Eliminates N+1 query storms and lazy loading issues while providing Fractal with complete dependency topology.
+
+##### Guideline 2: Traditional JPA Entity Associations (`@ManyToOne`)
+When using object relationships, leave `@ShardedKey` parameterless:
+```java
+@Entity
+@Table(name = "projects")
+@ShardedEntity
+public class Project {
+    @Id
+    private UUID id;
+
+    // Zero parameters needed: Fractal infers Organization.class and "org_id"
+    @ShardedKey
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "org_id")
+    private Organization organization;
+}
+```
+
+##### Guideline 3: Direct Tenant ID Denormalization (Single-Hop Optimization)
+For ultra-high-volume leaf tables (e.g. `events`, `audit_logs`, `invoices`), consider denormalizing `org_id` directly onto the table:
+```java
+@Entity
+@Table(name = "audit_logs")
+@ShardedEntity
+public class AuditLog {
+    @Id
+    private UUID id;
+
+    // Direct link to root bypasses multi-table joins during rebalancing
+    @Column(name = "org_id")
+    @ShardedKey(targetEntity = Organization.class)
+    private String orgId;
+}
+```
+- **Why**: Rebalancer generates direct `SELECT * FROM audit_logs WHERE org_id = :userId` queries without multi-table JOIN overhead.
+
+#### Discovery Mechanics Summary:
 1. **Root Partition Anchor**: Exactly one entity must have [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) (legacy `@ShardedEntity(root = true)` is also supported for backward compatibility). Its `@ShardedKey` field defines `rootTable` and `rootIdColumn`.
 2. **Foreign Key Hopping**: Descendant entities specify `@ShardedKey` on entity references (`@ManyToOne`) or scalar fields (`targetEntity = ...`).
 3. **Status Column Discovery**: `@ShardedStatus` designates the tenant status column on the root entity. Column names and values (`migratingValue`, `activeValue`) are inferred from JPA `@Column` or annotations.
@@ -1126,8 +1339,10 @@ Attempting to bypass routing lock-in using `@Transactional(propagation = Propaga
 mvn clean test
 ```
 
-The test suite validates the starter across 16 test classes covering 59 automated test cases:
+The test suite validates the starter across 18 test classes covering 68 automated test cases:
 
+- `DualRingMigrationRoutingTest`: Asserts dynamic dual-ring routing during active rebalancing (pending tenants route to old source shard, active migrating tenant throws `TenantMigratingException`, completed tenants immediately cut over to new ring shard, non-migrating bystanders route unaffected), zero-overhead fast path in steady state, and Caffeine caching of global rebalance status.
+- `ShardedRootAnnotationTest`: Verifies entity discovery, hop graph resolution, and sharding key extraction using the `@ShardedRoot` and `@ShardedKey` annotations.
 - `ConsistentHashRouterTest`: Validates deterministic routing, MD5 hash calculation, 64-bit ring wrap-around, and uniform distribution across virtual nodes.
 - `RoutingIntegrationTest`: Tests dynamic shard switching, primary fallback, and method-level SpEL resolution using H2 databases.
 - `SecurityRoutingIntegrationTest`: Confirms end-to-end shard routing from synthetic JWT tokens (`sub` claim) in `SecurityContextHolder`.
