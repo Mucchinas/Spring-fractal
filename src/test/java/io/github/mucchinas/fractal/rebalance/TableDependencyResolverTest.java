@@ -133,4 +133,29 @@ class TableDependencyResolverTest {
         assertThat(plans).anyMatch(p -> p.tableName().equals("users"));
         assertThat(plans).anyMatch(p -> p.tableName().equals("notifications"));
     }
+
+    @Test
+    void shouldThrowExceptionWhenCycleExistsInForeignKeyGraph() {
+        List<TableForeignKey> cyclicFks = List.of(
+                new TableForeignKey("table_a", "b_id", "table_b", "id"),
+                new TableForeignKey("table_b", "a_id", "table_a", "id")
+        );
+        TableDependencyResolver cyclicResolver = new TableDependencyResolver(null, cyclicFks);
+
+        org.assertj.core.api.Assertions.assertThatThrownBy(() ->
+                cyclicResolver.resolveInsertOrder(List.of("table_a", "table_b"))
+        ).isInstanceOf(IllegalStateException.class)
+         .hasMessageContaining("Rilevato ciclo nelle Foreign Key");
+    }
+
+    @Test
+    void shouldHandleSelfReferencingForeignKeyWithoutTreatingAsCycle() {
+        List<TableForeignKey> selfFks = List.of(
+                new TableForeignKey("employees", "manager_id", "employees", "id")
+        );
+        TableDependencyResolver selfResolver = new TableDependencyResolver(null, selfFks);
+
+        List<String> order = selfResolver.resolveInsertOrder(List.of("employees"));
+        assertThat(order).containsExactly("employees");
+    }
 }

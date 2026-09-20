@@ -55,6 +55,19 @@ class CustomClaimSecurityRoutingIntegrationTest {
         assertThat(targetShard).isNotBlank().startsWith("shard-");
     }
 
+    @Test
+    void shouldFailWhenConfiguredCustomClaimIsMissingFromToken() {
+        Jwt jwt = Jwt.withTokenValue("jwt-without-custom-claim")
+                .header("alg", "none")
+                .claim("sub", "user-123")
+                .build();
+
+        SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt, List.of()));
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> tenantService.executeAction())
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Impossibile determinare la chiave di sharding");
+    }
+
     @SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
     @Import({SecuredTenantService.class, FractalAutoConfiguration.class})
     static class CustomClaimApp {}

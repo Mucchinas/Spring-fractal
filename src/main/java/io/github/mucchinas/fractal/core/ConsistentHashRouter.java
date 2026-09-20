@@ -12,8 +12,12 @@ public class ConsistentHashRouter {
     private final SortedMap<Long, String> ring = new TreeMap<>();
 
     public ConsistentHashRouter(Collection<String> shardNames, int numberOfVirtualNodes) {
-        for (String shardName : shardNames) {
-            addShard(shardName, numberOfVirtualNodes);
+        if (shardNames != null) {
+            for (String shardName : shardNames) {
+                if (shardName != null && !shardName.isBlank()) {
+                    addShard(shardName, numberOfVirtualNodes);
+                }
+            }
         }
     }
 
@@ -26,7 +30,7 @@ public class ConsistentHashRouter {
     }
 
     public String routeNode(String key) {
-        if (ring.isEmpty()) {
+        if (key == null || ring.isEmpty()) {
             return null;
         }
 

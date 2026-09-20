@@ -79,6 +79,27 @@ class SecurityRoutingIntegrationTest {
         assertThat(ShardContextHolder.getShard()).isNull();
     }
 
+    @Test
+    void shouldPrioritizeJwtExtractorOverSpelKeyWhenBothPresent() {
+        Jwt jwt = Jwt.withTokenValue("finto").header("alg", "none").claim("sub", "jwt-priority-user").build();
+        SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(jwt, List.of()));
+
+        // Method has @Sharded(key = "#paramKey")
+        // ConsistentHashRouter for jwt-priority-user vs spel-user
+        String shard = businessService.eseguiConParametro("spel-user");
+        assertThat(shard).isNotBlank().startsWith("shard-");
+        assertThat(ShardContextHolder.getShard()).isNull();
+    }
+
+    @Test
+    void shouldFallbackToSpelKeyWhenJwtExtractorFindsNoKey() {
+        SecurityContextHolder.clearContext();
+
+        String shard = businessService.eseguiConParametro("fallback-tenant");
+        assertThat(shard).isNotBlank().startsWith("shard-");
+        assertThat(ShardContextHolder.getShard()).isNull();
+    }
+
     @SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
     @Import({SecuredBusinessService.class, FractalAutoConfiguration.class})
     static class DummyApp { }
@@ -94,6 +115,11 @@ class SecurityRoutingIntegrationTest {
         @Sharded
         public String queryCheFallisce() {
             throw new RuntimeException("Errore DB!");
+        }
+
+        @Sharded(key = "#paramKey")
+        public String eseguiConParametro(String paramKey) {
+            return ShardContextHolder.getShard();
         }
     }
 }

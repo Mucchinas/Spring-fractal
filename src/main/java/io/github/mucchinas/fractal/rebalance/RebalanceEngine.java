@@ -120,6 +120,10 @@ public class RebalanceEngine {
 
                     if (source == null || target == null) {
                         System.err.println("FRACTAL: Shard non trovato: source=" + action.sourceShard() + ", target=" + action.targetShard());
+                        setTenantStatus(userId, props.getActiveValue());
+                        if (topologyManager != null) {
+                            topologyManager.markTenantActive(userId);
+                        }
                         continue;
                     }
 

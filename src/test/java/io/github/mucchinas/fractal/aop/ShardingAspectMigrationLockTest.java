@@ -74,6 +74,33 @@ class ShardingAspectMigrationLockTest {
         assertThat(ShardContextHolder.getShard()).isNull();
     }
 
+    @Test
+    void shouldRestoreAccessWhenTenantFinishesMigration() {
+        String tenant = "tenant-restored";
+        topologyManager.markTenantMigrating(tenant);
+        assertThatThrownBy(() -> workService.processTenant(tenant))
+                .isInstanceOf(TenantMigratingException.class);
+
+        // Mark active again
+        topologyManager.markTenantActive(tenant);
+        String shard = workService.processTenant(tenant);
+        assertThat(shard).isNotBlank().startsWith("shard-");
+        assertThat(ShardContextHolder.getShard()).isNull();
+    }
+
+    @Test
+    void shouldTrackInFlightRequestsDuringExecutionAndDecrementAfterwards() {
+        String tenant = "tenant-inflight-check";
+        topologyManager.setRebalanceActive(true);
+        try {
+            long inFlightInside = workService.checkInFlightCount(tenant, topologyManager);
+            assertThat(inFlightInside).isEqualTo(1L);
+            assertThat(topologyManager.getInFlightRequestCount(tenant)).isEqualTo(0L);
+        } finally {
+            topologyManager.setRebalanceActive(false);
+        }
+    }
+
     @SpringBootApplication(exclude = DataSourceAutoConfiguration.class)
     @Import({ShardedWorkService.class, FractalAutoConfiguration.class})
     static class TestApp {}
@@ -83,6 +110,11 @@ class ShardingAspectMigrationLockTest {
         @Sharded(key = "#tenantId")
         public String processTenant(String tenantId) {
             return ShardContextHolder.getShard();
+        }
+
+        @Sharded(key = "#tenantId")
+        public long checkInFlightCount(String tenantId, TopologyManager topologyManager) {
+            return topologyManager.getInFlightRequestCount(tenantId);
         }
     }
 }

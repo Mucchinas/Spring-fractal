@@ -38,19 +38,57 @@ class RoutingIntegrationTest {
     @Autowired
     private DataSource routingDataSource;
 
+    @org.junit.jupiter.api.BeforeEach
+    void setUp() {
+        JdbcTemplate jdbc = new JdbcTemplate(routingDataSource);
+
+        // Seed primary
+        ShardContextHolder.clear();
+        jdbc.execute("CREATE TABLE IF NOT EXISTS test_marker (id VARCHAR(50) PRIMARY KEY, marker VARCHAR(50))");
+        jdbc.execute("MERGE INTO test_marker KEY(id) VALUES ('fixed', 'from-primary')");
+
+        // Seed shard-1
+        ShardContextHolder.setShard("shard-1");
+        jdbc.execute("CREATE TABLE IF NOT EXISTS test_marker (id VARCHAR(50) PRIMARY KEY, marker VARCHAR(50))");
+        jdbc.execute("MERGE INTO test_marker KEY(id) VALUES ('fixed', 'from-shard-1')");
+
+        // Seed shard-2
+        ShardContextHolder.setShard("shard-2");
+        jdbc.execute("CREATE TABLE IF NOT EXISTS test_marker (id VARCHAR(50) PRIMARY KEY, marker VARCHAR(50))");
+        jdbc.execute("MERGE INTO test_marker KEY(id) VALUES ('fixed', 'from-shard-2')");
+
+        ShardContextHolder.clear();
+    }
+
     @AfterEach
     void tearDown() {
         ShardContextHolder.clear();
     }
 
     @Test
-    void shouldRouteToCorrectShardBasedOnSpel() {
+    void shouldRouteToCorrectShardBasedOnSpelAndExecuteOnTargetDb() {
         String userA = "lorenzo";
         String userB = "mario";
+
         String shardUsatoPerA = businessService.eseguiQuery(userA);
         String shardUsatoPerB = businessService.eseguiQuery(userB);
+
         assertThat(shardUsatoPerA).isNotBlank().startsWith("shard-");
         assertThat(shardUsatoPerB).isNotBlank().startsWith("shard-");
+        assertThat(ShardContextHolder.getShard()).isNull();
+
+        // Verify physical database reading matches routed shard
+        String markerA = businessService.readMarker(userA);
+        assertThat(markerA).isEqualTo("from-" + shardUsatoPerA);
+
+        String markerB = businessService.readMarker(userB);
+        assertThat(markerB).isEqualTo("from-" + shardUsatoPerB);
+    }
+
+    @Test
+    void shouldFallbackToPrimaryWhenMethodIsNotSharded() {
+        String markerDefault = businessService.readMarkerWithoutSharding();
+        assertThat(markerDefault).isEqualTo("from-primary");
         assertThat(ShardContextHolder.getShard()).isNull();
     }
 
@@ -71,6 +109,15 @@ class RoutingIntegrationTest {
         public String eseguiQuery(String userId) {
             jdbcTemplate.execute("SELECT 1");
             return ShardContextHolder.getShard();
+        }
+
+        @Sharded(key = "#userId")
+        public String readMarker(String userId) {
+            return jdbcTemplate.queryForObject("SELECT marker FROM test_marker WHERE id = 'fixed'", String.class);
+        }
+
+        public String readMarkerWithoutSharding() {
+            return jdbcTemplate.queryForObject("SELECT marker FROM test_marker WHERE id = 'fixed'", String.class);
         }
     }
 }

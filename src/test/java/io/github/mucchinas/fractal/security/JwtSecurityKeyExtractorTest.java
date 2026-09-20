@@ -83,4 +83,29 @@ class JwtSecurityKeyExtractorTest {
 
         assertThat(extractor.extractKey()).isNull();
     }
+
+    @Test
+    void shouldReturnNullWhenSecurityContextAuthenticationIsNull() {
+        JwtSecurityKeyExtractor extractor = new JwtSecurityKeyExtractor();
+        SecurityContextHolder.clearContext();
+        assertThat(extractor.extractKey()).isNull();
+    }
+
+    @Test
+    void shouldReturnNullWhenAuthenticationIsNotJwt() {
+        JwtSecurityKeyExtractor extractor = new JwtSecurityKeyExtractor();
+        org.springframework.security.authentication.UsernamePasswordAuthenticationToken nonJwtAuth =
+                new org.springframework.security.authentication.UsernamePasswordAuthenticationToken("user", "pass", List.of());
+        SecurityContextHolder.getContext().setAuthentication(nonJwtAuth);
+        assertThat(extractor.extractKey()).isNull();
+    }
+
+    @Test
+    void shouldDefaultToSubjectWhenClaimNameIsBlankOrNull() {
+        JwtSecurityKeyExtractor nullExtractor = new JwtSecurityKeyExtractor(null);
+        assertThat(nullExtractor.getClaimName()).isEqualTo("sub");
+
+        JwtSecurityKeyExtractor blankExtractor = new JwtSecurityKeyExtractor("   ");
+        assertThat(blankExtractor.getClaimName()).isEqualTo("sub");
+    }
 }

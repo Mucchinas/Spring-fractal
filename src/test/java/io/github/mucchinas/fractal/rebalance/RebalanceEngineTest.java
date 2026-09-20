@@ -101,6 +101,34 @@ class RebalanceEngineTest {
         assertThat(remainingTask2).isEqualTo(1);
     }
 
+    @Test
+    void shouldSafelyHandleMissingSourceOrTargetShardWithoutLockingTenant() {
+        primaryJdbc.execute("INSERT INTO users VALUES ('user-unmapped', 'ACTIVE')");
+
+        MigrationDeltaCalculator.MigrationAction invalidTargetAction =
+                new MigrationDeltaCalculator.MigrationAction("user-unmapped", "shard-1", "shard-nonexistent");
+        rebalanceEngine.executeMigration(List.of(invalidTargetAction));
+
+        // Tenant status must remain/return to ACTIVE and not stuck in MIGRATING
+        String status = primaryJdbc.queryForObject("SELECT status FROM users WHERE id = 'user-unmapped'", String.class);
+        assertThat(status).isEqualTo("ACTIVE");
+
+        MigrationDeltaCalculator.MigrationAction invalidSourceAction =
+                new MigrationDeltaCalculator.MigrationAction("user-unmapped", "shard-nonexistent", "shard-2");
+        rebalanceEngine.executeMigration(List.of(invalidSourceAction));
+
+        status = primaryJdbc.queryForObject("SELECT status FROM users WHERE id = 'user-unmapped'", String.class);
+        assertThat(status).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    void shouldHandleNullOrEmptyMigrationActionsGracefully() {
+        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> {
+            rebalanceEngine.executeMigration(null);
+            rebalanceEngine.executeMigration(List.of());
+        });
+    }
+
     private DataSource createDataSource(String url) {
         DriverManagerDataSource ds = new DriverManagerDataSource();
         ds.setDriverClassName("org.h2.Driver");

@@ -485,7 +485,7 @@ For advanced topics, architectural diagrams, and enterprise deployment scenarios
 | **[5. Configuration Reference](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#5-configuration-property-specifications)** | Exhaustive property matrix and fully documented `application.yml` template |
 | **[6. Advanced Usage & Patterns](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#6-advanced-usage--integration-patterns)** | Custom `ShardingKeyExtractor`, JWT claim types, HTTP header extraction |
 | **[7. Pitfalls & Architecture Solutions](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#7-technical-considerations-pitfalls--solutions)** | Schema management, multi-datasource joins, the Transaction Aggregation Problem & `REQUIRES_NEW` dangers |
-| **[8. Verification & Test Suite](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#8-verification-testing--test-suite-reference)** | Coverage breakdown across all 18 test suites (68 automated unit/integration tests) |
+| **[8. Verification & Test Suite](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#8-verification-testing--test-suite-reference)** | Coverage breakdown across all 20 test suites (97 automated unit/integration tests) |
 
 ---
 
@@ -496,7 +496,7 @@ For advanced topics, architectural diagrams, and enterprise deployment scenarios
 - Apache Maven 3.8+
 
 ### Execution
-Run the full test suite (68 unit and integration tests):
+Run the full test suite (97 unit and integration tests):
 
 ```bash
 mvn clean test

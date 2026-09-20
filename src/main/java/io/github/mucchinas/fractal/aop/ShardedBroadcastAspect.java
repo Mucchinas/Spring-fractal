@@ -24,8 +24,10 @@ public class ShardedBroadcastAspect {
         this.shardNames = shardNames != null ? shardNames : Set.of();
     }
 
-    @Around("@annotation(shardedBroadcast) || @within(shardedBroadcast)")
-    public Object broadcast(ProceedingJoinPoint joinPoint, ShardedBroadcast shardedBroadcast) throws Throwable {
+    @Around("@annotation(io.github.mucchinas.fractal.annotation.ShardedBroadcast) || @within(io.github.mucchinas.fractal.annotation.ShardedBroadcast)")
+    public Object broadcast(ProceedingJoinPoint joinPoint) throws Throwable {
+        org.aspectj.lang.reflect.MethodSignature signature = (org.aspectj.lang.reflect.MethodSignature) joinPoint.getSignature();
+        ShardedBroadcast shardedBroadcast = signature.getMethod().getAnnotation(ShardedBroadcast.class);
         if (shardedBroadcast == null) {
             shardedBroadcast = joinPoint.getTarget().getClass().getAnnotation(ShardedBroadcast.class);
         }

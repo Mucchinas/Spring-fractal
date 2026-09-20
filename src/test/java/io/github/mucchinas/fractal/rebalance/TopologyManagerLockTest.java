@@ -10,6 +10,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -150,6 +151,28 @@ class TopologyManagerLockTest {
 
         Integer count = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM fractal_shard_topology WHERE shard_name = 'shard-alpha'", Integer.class);
+        assertEquals(1, count);
+    }
+
+    @Test
+    void shouldHandlePendingMigrationsBatchAndNullSafely() {
+        topologyManager.registerPendingMigrations(Map.of("t1", "shard-1", "t2", "shard-2"));
+        assertEquals("shard-1", topologyManager.getPendingSourceShard("t1"));
+        assertEquals("shard-2", topologyManager.getPendingSourceShard("t2"));
+        assertNull(topologyManager.getPendingSourceShard(null));
+        assertNull(topologyManager.getPendingSourceShard("non-existent"));
+
+        assertEquals(0, topologyManager.getInFlightRequestCount(null));
+        assertTrue(topologyManager.awaitTenantQuiescence(null, Duration.ofSeconds(1)));
+    }
+
+    @Test
+    void shouldRecordPendingMigrationIdempotently() {
+        topologyManager.recordPendingMigration("tenant-dup", "shard-1", "shard-2");
+        topologyManager.recordPendingMigration("tenant-dup", "shard-1", "shard-2");
+
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM fractal_tenant_migrations WHERE tenant_id = 'tenant-dup'", Integer.class);
         assertEquals(1, count);
     }
 }
