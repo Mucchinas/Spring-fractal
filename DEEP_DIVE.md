@@ -223,6 +223,47 @@ Method Invocation
 3. **Tier 3 - Fail-Fast Guard**:
    - If neither a strategic extractor nor SpEL evaluation produces a valid key, execution halts immediately with an `IllegalStateException`, aborting the transaction before any database connection is acquired.
 
+#### The Core Invariant: Key Alignment Between Service Routing and @ShardedRoot
+
+> [!IMPORTANT]
+> **The Key Alignment Invariant**:
+> Whatever identifier is resolved by the Sharding Key Extraction Pipeline (from a JWT claim or SpEL expression) **must match the exact value stored in the column annotated with [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java) on the [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) entity**.
+>
+> The chosen routing key **must exist as a physical column on the root table** (typically its `@Id` or unique partition key).
+
+##### Architectural Mechanics: Why Alignment is Mandatory
+
+```
+[Service Invocation] ---> Extracts key (e.g. JWT "tenant_id" = "org_123") ---> hash("org_123") ---> Routes to Shard 1
+                                                                                                          |
+                                                                         [MUST MATCH]                     v
+                                                                                              [Local Shard 1 DB]
+                                                                                              organizations.id = 'org_123'
+                                                                                              projects.org_id = 'org_123'
+                                                                                                          ^
+                                                                         [MUST MATCH]                     |
+[Cluster Rebalance]  ---> Reads root table: organizations.id ("org_123")   ---> hash("org_123") ---> Migrates to Shard 1
+```
+
+If these two concepts diverge:
+- If a service method extracts a user ID (`usr_888` from JWT `sub`), but the root table is `organizations` where `@ShardedKey` is `organizations.id` (`org_123`):
+  1. The service hashes `usr_888` and sends queries to Shard A.
+  2. The rebalancer reads `organizations.id = org_123`, hashes `org_123`, and places the organization and all its projects on Shard B.
+  3. Queries on Shard A execute against a database where the organization's rows physically do not exist, returning empty result sets or null pointer exceptions.
+
+##### Best Practice Guidelines for Key Selection
+
+1. **B2B Multi-Tenant Applications (Organization Partitioning)**:
+   - **Root Entity**: Set `@ShardedRoot` on `Organization` (or `Tenant`, `Company`).
+   - **Root Key**: `@Id @ShardedKey private String id;` (stores `org_123`).
+   - **JWT Claim**: Configure `fractal.sharding.jwt.claim-name: tenant_id` (or `org_id`). Ensure identity tokens contain `"tenant_id": "org_123"`.
+   - **SpEL Fallback**: For asynchronous or internal methods without security context, use `@Sharded(key = "#orgId")`.
+2. **B2C Consumer Applications (User / Subject Partitioning)**:
+   - **Root Entity**: Set `@ShardedRoot` on `User` (or `Account`, `Customer`).
+   - **Root Key**: `@Id @ShardedKey private String id;` (stores `usr_456`).
+   - **JWT Claim**: Use the default `fractal.sharding.jwt.claim-name: sub`. OAuth2/OIDC access tokens store the authenticated user ID in the standard `sub` claim.
+   - **SpEL Fallback**: Use `@Sharded(key = "#userId")` or `@Sharded(key = "#accountId")`.
+
 ---
 
 ## 3. Automated Rebalancer & Migration Subsystem
@@ -657,6 +698,13 @@ public class AuditLog {
 ```
 - **Why**: Rebalancer generates direct `SELECT * FROM audit_logs WHERE org_id = :userId` queries without multi-table JOIN overhead.
 
+##### Guideline 4: Mandatory Key Alignment between Service Routing and @ShardedRoot
+Ensure that the field annotated with [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java) on [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) directly corresponds to the value extracted by the routing aspect ([`@Sharded`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/Sharded.java)):
+- **Present in Root Table**: The sharding key **must be a physical column on the root entity's table** (typically its `@Id` primary key).
+- **B2B SaaS**: Root entity is `Organization`, `@ShardedKey` is `id`, and the JWT extraction claim is set to `tenant_id` or `org_id`.
+- **B2C Platforms**: Root entity is `User`, `@ShardedKey` is `id`, and JWT extraction claim is set to `sub` (or SpEL extracts `#userId`).
+- **Format Consistency**: If the root entity uses `UUID` or `String`, verify that the JWT claim or SpEL argument produces the exact same string serialization (e.g. lowercase UUID string) expected by the root table's column.
+
 #### Discovery Mechanics Summary:
 1. **Root Partition Anchor**: Exactly one entity must have [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) (legacy `@ShardedEntity(root = true)` is also supported for backward compatibility). Its `@ShardedKey` field defines `rootTable` and `rootIdColumn`.
 2. **Foreign Key Hopping**: Descendant entities specify `@ShardedKey` on entity references (`@ManyToOne`) or scalar fields (`targetEntity = ...`).
@@ -773,19 +821,39 @@ If an application instance terminates mid-migration (SIGKILL, container preempti
 
 ### Architecture Profile Matrix
 
-| Architecture Profile | Sharding Key Source | Entity Discovery Strategy | Rebalancing & Migrations | Replica & Reference Tables | Ideal For |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Profile 1: B2B Multi-Tenant SaaS** | JWT Security Claim (`tenant_id`, `org_id`) | Domain Annotations ([`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java), [`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java)) | Automated Rebalancer (`enabled: true`, zero-config) | [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) + [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) for lookup tables | Multi-tenant SaaS with authenticated enterprise tenants |
-| **Profile 2: High-Throughput User / Account Partitioning** | Service Method SpEL (`#userId`, `#accountId`) | Domain Annotations or Database Catalog | Automated Rebalancer (`enabled: true`) | Replicated reference tables (`currencies`, `tiers`) | B2C E-Commerce, FinTech, social feeds, gaming platforms |
-| **Profile 3: Turnkey Legacy Catalog Sharding** | JWT or Method SpEL | Database Catalog Introspection (`shard-all: true`) | Automated Rebalancer (`enabled: true`, topological sort) | Unconnected tables auto-replicated to all shards | Existing relational databases with established foreign key constraints |
-| **Profile 4: Read-Mostly Reference Replication** | JWT or Method SpEL | Domain Entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) | Optional | Startup sync via [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java) + parallel [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) | Global reference catalogs requiring local shard joins |
-| **Profile 5: Asynchronous Worker / Event Consumer** | Method SpEL on Message Payload (`#event.tenantId`) | N/A (Stateless Routing) | Disabled (`rebalancer.enabled: false`) | Local caching or primary queries | Background jobs, Kafka/RabbitMQ consumers, batch workers |
+| Architecture Profile | Sharding Key Source | Entity Discovery Strategy | Multi-Tenancy & Data Distribution Reality | Rebalancing & Migrations | Replicated / Reference Data | Ideal For |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Profile 1: B2B Multi-Tenant SaaS (Pooled Sharding)** | JWT Security Claim (`tenant_id`, `org_id`) | Domain Annotations ([`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java), [`@ShardedEntity`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedEntity.java), [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java), [`@ShardedStatus`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedStatus.java)) | **Pooled Multi-Tenancy**: Multiple tenants share each physical shard. All data for any single tenant is strictly co-located on the same shard for native local joins. | Automated Rebalancer (`enabled: true`, zero-config) | [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) + [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) | Enterprise B2B SaaS with hundreds or thousands of organizational tenants |
+| **Profile 2: High-Throughput B2C Account Partitioning** | Service Method SpEL (`#userId`, `#accountId`) | Domain Annotations or Database Catalog | **Entity Partitioning**: Millions of consumer user accounts uniformly spread across shard pools. Single-account operations stay local; cross-account flows require Outbox/Saga. | Automated Rebalancer (`enabled: true`, high virtual node factor) | Replicated reference tables (`currencies`, `tiers`) | FinTech, E-Commerce, consumer banking, crypto wallets, gaming platforms |
+| **Profile 3: Turnkey Legacy Catalog Sharding** | JWT or Method SpEL | Database Catalog Introspection (`shard-all: true`) | **Catalog-Driven Partitioning**: Relational trees are discovered via ANSI foreign keys. Tables linked to root are sharded; unlinked tables become global replicas. | Automated Rebalancer (`enabled: true`, topological sort) | Disconnected tables automatically classified as replicas and cloned | Brownfield monoliths with established schemas where entity changes are prohibited |
+| **Profile 4: Read-Mostly Reference Replication** | JWT or Method SpEL | Domain Entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java) | **Global Broadcast & Local Join**: Sharded operational data (orders) joins locally with replicated catalogs (tax rates, products) without cross-network hops. | Optional | Auto-synced on startup/cluster joins via [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java) + parallel [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java) | Global reference catalogs requiring sub-millisecond local joins with sharded tables |
+| **Profile 5: Asynchronous Worker / Event Consumer** | Method SpEL on Message Payload (`#event.tenantId`) | N/A (Stateless Routing) | **Stateless Shard Context Leasing**: Worker threads lease the shard context for the duration of message processing, cleaning up immediately in `finally`. | Disabled (`rebalancer.enabled: false`) | Read from local shard or primary DB | Background workers, Kafka/RabbitMQ consumers, `@Scheduled` batch jobs |
 
 ---
 
-### Profile 1: B2B Multi-Tenant SaaS (Zero-Config)
+### Profile 1: B2B Multi-Tenant SaaS (Pooled Sharding & Tenant Co-Location)
 
-In B2B multi-tenant applications, authenticated REST requests carry a JWT with an enterprise tenant ID (`org_id`). Tenants require strict isolation across physical database shards.
+#### The Multi-Tenancy Architecture Reality: Pooled Sharding
+
+In consistent-hashing horizontal sharding, physical database shards are **shared pools**, not dedicated single-tenant databases:
+- If an application has **100 enterprise tenants** and **2 physical shards**, each physical shard hosts approximately **50 tenants**.
+- Multiple tenants share the same PostgreSQL/MySQL instance, the same table schemas (`organizations`, `projects`, `tasks`), disk storage, and HikariCP connection pool on that shard.
+- Logical tenant separation within each physical database is maintained at the query and application layer via `org_id` foreign keys.
+
+#### What Fractal Solves for B2B Multi-Tenancy:
+
+1. **Strict Tenant Data Co-Location**:
+   All child and leaf entities belonging to a single organization (e.g. `projects`, `tasks`, `invoices`, `audit_records`) are guaranteed to reside on the **exact same physical shard** as the root `Organization` record.
+   - **Local Relational Joins**: Service methods execute native SQL joins (`JOIN projects p ON ... JOIN tasks t ON ...`) on the shard with microsecond latency. No distributed cross-shard joins or two-phase commit (2PC) protocols are needed.
+   - **Local ACID Transactions**: All writes within a tenant aggregate commit atomically in a single local database transaction.
+2. **Horizontal Capacity & Storage Scaling**:
+   Rather than provisioning an exorbitantly expensive monolithic 10TB database instance, storage and IOPS are partitioned across multiple commodity database instances (e.g. 5 nodes with 2TB each).
+3. **Blast Radius Reduction**:
+   A hardware outage, CPU exhaustion, or lock contention on `shard-1` only impacts the subset of tenants hashed to `shard-1`. Tenants allocated to `shard-2` through `shard-5` remain completely unaffected and operational.
+4. **Dynamic Capacity Rebalancing (Noisy-Neighbor Mitigation)**:
+   If Tenant X on `shard-1` experiences sudden business growth and consumes excessive IOPS, an administrator can provision `shard-3` in `application.yml`. Fractal's online rebalancing engine automatically migrates a subset of tenants (or Tenant X itself) to the new shard with sub-second cutover and zero application downtime.
+
+#### Reference Configuration (`application.yml`)
 
 ```yaml
 fractal:
@@ -793,7 +861,7 @@ fractal:
     enabled: true
     virtual-nodes: 150
     jwt:
-      claim-name: org_id
+      claim-name: org_id  # Automatically extracted from SecurityContextHolder
     primary:
       jdbc-url: jdbc:postgresql://db-primary:5432/saas_primary
       username: saas_admin
@@ -815,29 +883,90 @@ fractal:
       status-cache-ttl: 2s
 ```
 
-- **Domain Model**:
-  ```java
-  @Entity
-  @Table(name = "organizations")
-  @ShardedRoot
-  public class Organization {
-      @Id @ShardedKey private String id;
-      @ShardedStatus private String status;
-  }
-  ```
-- **Service Layer**: Zero routing code required. Annotating service methods with [`@Sharded`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/Sharded.java) automatically extracts `org_id` from the active JWT in `SecurityContextHolder`.
+#### Domain Model & Service Layer
+
+```java
+// 1. Root Entity: Anchor of the tenant aggregate
+@Entity
+@Table(name = "organizations")
+@ShardedRoot
+public class Organization {
+    @Id
+    @ShardedKey
+    private String id; // The primary routing key
+
+    private String name;
+
+    @ShardedStatus(migratingValue = "MIGRATING", activeValue = "ACTIVE")
+    @Column(name = "sync_status")
+    private String syncStatus;
+}
+
+// 2. Child Entity: Co-located on the same shard via organization FK
+@Entity
+@Table(name = "projects")
+@ShardedEntity
+public class Project {
+    @Id
+    private UUID id;
+
+    @ShardedKey
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "org_id")
+    private Organization organization;
+}
+
+// 3. Service Layer: Zero routing boilerplate
+@Service
+public class ProjectService {
+    @Autowired private ProjectRepository projectRepository;
+
+    // Automatically extracts org_id from JWT in SecurityContextHolder and routes to the tenant's shard
+    @Sharded
+    @Transactional
+    public Project createProject(String projectName) {
+        // Native local SQL execution on the tenant's assigned shard
+        return projectRepository.save(new Project(projectName));
+    }
+}
+```
 
 ---
 
-### Profile 2: High-Throughput User / Account Partitioning (SpEL)
+### Profile 2: High-Throughput B2C Account Partitioning (FinTech, E-Commerce, Gaming)
 
-For B2C consumer platforms (such as consumer banking, crypto wallets, or mobile apps), requests are routed according to a specific user ID or account number supplied in method arguments.
+#### Context & Architectural Drivers
+
+In consumer platforms (retail banking, digital wallets, e-commerce shopping carts, multiplayer games), there are no "organizations" or enterprise JWT claims. Instead, the system manages tens of millions of discrete consumer user accounts (`user_id`, `account_id`, `wallet_id`).
+
+The primary architectural bottleneck is **write throughput (IOPS)** and **table index size**:
+- A single database cannot sustain 100,000 writes/second or hold a 500-million-row B-tree index in RAM.
+- Sharding distributes the IOPS load uniformly across 4, 8, or 16 database instances (e.g. 8 shards handling 12,500 writes/sec each).
+
+#### Key Mechanics & Considerations
+
+1. **Granular SpEL Method Routing**:
+   Routing is evaluated dynamically on service method parameters via Spring Expression Language:
+   `@Sharded(key = "#accountId")` or `@Sharded(key = "#request.walletId")`.
+2. **Virtual Node Tuning for Uniform Distribution**:
+   With millions of random UUIDs or numeric account numbers, setting `virtual-nodes: 250` or higher guarantees an extremely uniform key distribution (<2% standard deviation across shards), preventing "hot shards."
+3. **The Cross-Shard Transfer Problem (Important Architecture Constraint)**:
+   - What happens when Account A (resident on `shard-alpha`) transfers funds to Account B (resident on `shard-beta`)?
+   - **Constraint**: A single `@Transactional` method **cannot** execute atomic writes across multiple shards because Spring's transaction manager binds exactly one JDBC `Connection` per transaction.
+   - **Solution**:
+     - *Single-Account Operations* (deposits, withdrawals, balance lookups, card authorizations) are local transactions executed on the account's shard with zero overhead.
+     - *Cross-Account Transfers* must be coordinated using the **Transactional Outbox Pattern** or **Saga Pattern**:
+       1. Shard Alpha: Debit Account A and record an `outbox_events` row in a single local transaction.
+       2. Asynchronous Event Publisher: Delivers the event to Kafka / RabbitMQ.
+       3. Consumer Worker: Executes credit on Account B on Shard Beta with idempotent deduplication.
+
+#### Reference Configuration (`application.yml`)
 
 ```yaml
 fractal:
   sharding:
     enabled: true
-    virtual-nodes: 250   # Higher density for ultra-uniform ring distribution
+    virtual-nodes: 250   # High virtual node factor for uniform distribution across millions of accounts
     primary:
       jdbc-url: jdbc:postgresql://db-primary:5432/fintech_primary
       username: admin
@@ -859,24 +988,55 @@ fractal:
       enabled: true
 ```
 
-- **Service Layer**:
-  ```java
-  @Service
-  public class AccountService {
-      @Sharded(key = "#accountId")
-      @Transactional
-      public Account balanceTransfer(String accountId, BigDecimal amount) {
-          // Routes directly to the shard owning accountId
-          return accountRepository.updateBalance(accountId, amount);
-      }
-  }
-  ```
+#### Service Layer
+
+```java
+@Service
+public class WalletService {
+    @Autowired private WalletRepository walletRepository;
+    @Autowired private OutboxRepository outboxRepository;
+
+    // 1. Single-account operation: Native atomic local transaction on account's shard
+    @Sharded(key = "#accountId")
+    @Transactional
+    public Wallet deposit(String accountId, BigDecimal amount) {
+        return walletRepository.addFunds(accountId, amount);
+    }
+
+    // 2. Cross-account transfer source phase: Debits Account A and writes Outbox on Shard Alpha
+    @Sharded(key = "#sourceAccountId")
+    @Transactional
+    public TransferInitiationResult initiateTransfer(String sourceAccountId, String targetAccountId, BigDecimal amount) {
+        walletRepository.subtractFunds(sourceAccountId, amount);
+        outboxRepository.save(new OutboxEvent("FUNDS_DEBITED", sourceAccountId, targetAccountId, amount));
+        return new TransferInitiationResult(UUID.randomUUID(), "PENDING_DESTINATION_CREDIT");
+    }
+}
+```
 
 ---
 
-### Profile 3: Turnkey Legacy Catalog Sharding (shard-all)
+### Profile 3: Turnkey Legacy Catalog Sharding (`shard-all: true`)
 
-For existing monoliths with mature database schemas, Fractal can introspect the database schema catalog directly without modifying existing JPA entities.
+#### Context & Architectural Drivers
+
+For existing enterprise monoliths with mature relational schemas and dozens of existing JPA entity classes, refactoring source code to add `@ShardedRoot`, `@ShardedEntity`, and `@ShardedKey` annotations across 50+ classes is often prohibited by project deadlines or risk governance.
+
+In this scenario, Fractal's **Database Catalog Introspection Engine** (`shard-all: true`) automatically inspects the ANSI database catalog and builds the dependency graph without modifying a single Java class.
+
+#### Key Mechanics:
+
+1. **ANSI Information Schema Discovery**:
+   [`TableDependencyResolver`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TableDependencyResolver.java) connects to the primary coordinator database and introspects `information_schema.referential_constraints` and `information_schema.key_column_usage`.
+2. **Automatic Dual-Category Classification**:
+   - **Sharded Tables**: Multi-hop breadth-first search (BFS) identifies all tables reachable via foreign key constraints from the designated `root-table` (e.g. `customers`). These tables are topologically sorted (insert order: parents before children; delete order: children before parents) for safe rebalancing.
+   - **Replicated Reference Tables**: Any user table that has **no foreign key path** to `root-table` (e.g. `zip_codes`, `tax_brackets`, `country_codes`) is automatically classified as a replicated reference table and synchronized to all shards by [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java).
+   - **Excluded Tables**: Non-business tables (`flyway_schema_history`, `databasechangelog`, `audit_logs`) are skipped via `exclude-tables`.
+3. **Requirements & Trade-offs**:
+   - *Requires Physical Database Foreign Keys*: Unlike domain entity annotations (which can model virtual logical hops in code), `shard-all` relies entirely on physical database constraints present in the information schema.
+   - *No Circular FK Dependencies*: Foreign key relationships among child tables must form a directed acyclic graph (DAG).
+
+#### Reference Configuration (`application.yml`)
 
 ```yaml
 fractal:
@@ -897,22 +1057,47 @@ fractal:
         password: ${DB_PASS}
     rebalancer:
       enabled: true
-      shard-all: true
-      root-table: customers
-      root-id-column: customer_id
-      status-column: sync_status
+      shard-all: true                # Automatically discovers and shards all child tables
+      root-table: customers          # Anchor table for the relational partition
+      root-id-column: customer_id    # Partition column on the anchor table
+      status-column: sync_status     # Migration lock column on customers table
       exclude-tables:
         - flyway_schema_history
         - audit_logs
+        - spring_session
 ```
-
-- **Catalog Resolution**: Discovers foreign key constraints via ANSI `information_schema`. Tables with foreign key relations to `customers` are topologically ordered for sharded migrations. Tables without paths to `customers` are auto-replicated to all shards.
 
 ---
 
-### Profile 4: Read-Mostly Reference Replication & Broadcasting
+### Profile 4: Read-Mostly Reference Replication & Multi-Shard Broadcasting
 
-Designed for applications with heavy relational joins between sharded operational data (e.g. orders, line items) and reference data (e.g. currencies, product catalogs, tax rates).
+#### The Distributed Join Challenge
+
+In almost every sharded business application, sharded operational data must join with global reference data:
+- `orders` (sharded by tenant) joins with `currencies` (global exchange rates).
+- `invoices` (sharded by customer) joins with `tax_rates` (global jurisdiction rates).
+- `products` (sharded by merchant) joins with `categories` (global taxonomic tree).
+
+Because sharded tables reside on separate physical database servers, cross-database SQL joins are impossible at the JDBC level. Querying a central database over HTTP/REST on every order query causes severe latency degradation.
+
+#### The Solution: Local Replicas & Broadcast Mutations
+
+1. **Local Replicas on Every Physical Shard**:
+   Mark global reference entities with [`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java).
+   - At application boot, [`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java) copies the entire table from the primary coordinator database to every physical shard.
+   - When new shards are added, they are automatically caught up with all reference data before accepting traffic.
+2. **Sub-Millisecond Native Shard Joins (Reads)**:
+   Application repositories execute native, local SQL joins on the shard with zero network hops:
+   ```sql
+   SELECT o.id, o.amount * c.exchange_rate
+   FROM orders o
+   JOIN currencies c ON o.currency_code = c.code
+   WHERE o.customer_id = :customerId;
+   ```
+3. **Multi-Shard Broadcast Writes**:
+   When reference data is updated (infrequent administrative mutations), annotate the service method with [`@ShardedBroadcast`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedBroadcast.java). Fractal concurrently executes the write against the primary database and all physical shards in parallel using a thread pool.
+
+#### Reference Configuration (`application.yml`)
 
 ```yaml
 fractal:
@@ -935,41 +1120,72 @@ fractal:
       enabled: false  # Rebalancer optional; replica sync always runs on startup
 ```
 
-- **Reference Entity**:
-  ```java
-  @Entity
-  @Table(name = "currencies")
-  @ShardedReplica
-  public class Currency {
-      @Id private String code;
-      private BigDecimal rate;
-  }
-  ```
-- **Broadcast Writes**:
-  ```java
-  @Service
-  public class CurrencyAdminService {
-      @ShardedBroadcast  // Concurrently writes updates to primary and all physical shards
-      @Transactional
-      public void updateRate(String code, BigDecimal newRate) {
-          currencyRepository.updateRate(code, newRate);
-      }
-  }
-  ```
-- **Local Shard Join**:
-  ```sql
-  -- Native local SQL join on shard-1 with zero cross-network calls
-  SELECT o.id, o.total * c.rate
-  FROM orders o
-  JOIN currencies c ON o.currency = c.code
-  WHERE o.org_id = :orgId
-  ```
+#### Code Examples
+
+```java
+// 1. Replicated Reference Entity
+@Entity
+@Table(name = "currencies")
+@ShardedReplica
+public class Currency {
+    @Id
+    private String code; // e.g., "USD", "EUR"
+    private BigDecimal exchangeRate;
+}
+
+// 2. Admin Service: Broadcasts rate updates to all physical shards in parallel
+@Service
+public class CurrencyAdminService {
+    @Autowired private CurrencyRepository currencyRepository;
+
+    @ShardedBroadcast
+    @Transactional
+    public void updateExchangeRate(String code, BigDecimal newRate) {
+        // Concurrently executes on primary DB and every physical shard
+        currencyRepository.updateRate(code, newRate);
+    }
+}
+
+// 3. Sharded Repository: High-performance local join on physical shard
+@Repository
+public interface OrderRepository extends JpaRepository<Order, UUID> {
+    @Query("""
+        SELECT o.id, o.amount * c.exchangeRate
+        FROM Order o
+        JOIN Currency c ON o.currencyCode = c.code
+        WHERE o.organizationId = :orgId
+    """)
+    List<Object[]> findConvertedOrderTotals(@Param("orgId") String orgId);
+}
+```
 
 ---
 
-### Profile 5: Asynchronous Worker / Event-Consumer Nodes
+### Profile 5: Asynchronous Worker, Stream Consumer & Event Processor Nodes
 
-In clusters with dedicated worker pods (e.g., Kafka consumers, RabbitMQ listeners, `@Scheduled` tasks), nodes route asynchronous messages to the proper shard without participating in rebalancing coordination.
+#### Context & Architectural Separation
+
+Enterprise deployments typically segregate interactive **Web API pods** (handling synchronous user HTTP traffic) from **Background Worker pods** (consuming Kafka/RabbitMQ events, running `@Scheduled` batch jobs, executing async tasks).
+
+Worker pods must route messages to the correct shard while avoiding uncoordinated rebalancing tasks.
+
+#### Key Mechanics & Best Practices
+
+1. **Stateless Payload Routing**:
+   Worker pods operate outside HTTP request contexts and have no JWT tokens. They extract the partition key directly from event payloads using method SpEL:
+   `@Sharded(key = "#event.tenantId")` or `@Sharded(key = "#record.customerId")`.
+2. **Rebalance Safety: Disabling the Rebalancer on Workers**:
+   Worker pods **MUST** configure:
+   ```yaml
+   fractal.sharding.rebalancer.enabled: false
+   fractal.sharding.primary.initialize-schema: false
+   ```
+   - *Rationale*: Prevents autoscaling worker pods from competing with Web API pods for the distributed `REBALANCE_LOCK` or attempting duplicate schema modifications on the primary database. Rebalancing orchestration is strictly reserved for Web API pods or dedicated operator jobs.
+3. **Thread Context Hygiene (Preventing Context Leaks)**:
+   Message broker consumers use long-lived, reused worker thread pools (e.g. `ConcurrentMessageListenerContainer`).
+   [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) guarantees that `ShardContextHolder.setShard(...)` is strictly leased for the duration of the method and cleared via `ShardContextHolder.clear()` in a `finally` block, preventing message N+1 from accidentally inheriting the shard context of message N.
+
+#### Reference Configuration (`application.yml`)
 
 ```yaml
 fractal:
@@ -979,7 +1195,7 @@ fractal:
       jdbc-url: jdbc:postgresql://db-primary:5432/cluster_primary
       username: worker_user
       password: ${DB_PASS}
-      initialize-schema: false  # Coordination tables managed by primary web API pods
+      initialize-schema: false   # Coordination tables managed exclusively by Web API pods
     shards:
       shard-1:
         jdbc-url: jdbc:postgresql://db-shard1:5432/cluster_shard1
@@ -990,18 +1206,26 @@ fractal:
         username: worker_user
         password: ${DB_PASS}
     rebalancer:
-      enabled: false  # Workers must not trigger rebalance migrations
+      enabled: false             # Background workers must NEVER initiate rebalance locks
 ```
 
-- **Consumer Method**:
-  ```java
-  @KafkaListener(topics = "order-events")
-  @Sharded(key = "#event.tenantId")
-  @Transactional
-  public void processOrderEvent(OrderEvent event) {
-      orderProcessor.handle(event);
-  }
-  ```
+#### Consumer Implementation
+
+```java
+@Component
+public class OrderEventConsumer {
+    @Autowired private OrderProcessingService orderProcessor;
+
+    // Extracts tenantId from message payload and binds execution to the appropriate shard
+    @KafkaListener(topics = "customer-events", groupId = "order-fulfillment-group")
+    @Sharded(key = "#event.tenantId")
+    @Transactional
+    public void processCustomerEvent(CustomerOrderEvent event) {
+        // Executes strictly on the shard holding event.tenantId's records
+        orderProcessor.handleOrder(event);
+    }
+}
+```
 
 ---
 

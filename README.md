@@ -212,6 +212,91 @@ WHERE projects.org_id = 'org_123';
 
 ---
 
+#### Mandatory Invariant & Best Practices: Aligning the Service Routing Key with `@ShardedRoot`
+
+> [!IMPORTANT]
+> **The Golden Rule of Fractal Sharding**:
+> The value extracted at runtime by [`@Sharded`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/Sharded.java) (from JWT claims or SpEL arguments) and the value stored in the [`@ShardedKey`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedKey.java) column of the [`@ShardedRoot`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedRoot.java) table **must represent the exact same identifier and refer to the exact same value in the database**.
+>
+> The chosen sharding key **must be physically present as a column in the root table** (typically its `@Id` or unique partition key).
+
+##### Why This Alignment is Mandatory (The Mechanics)
+
+Fractal operates on two cooperating paths:
+1. **Service Routing Path**: When a service method executes, [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) extracts the sharding key and hashes it to select the physical shard:
+   $$\text{Target Shard} = \text{router.routeNode}(\text{extractedKey})$$
+2. **Rebalance Migration Path**: When physical shards are added or scaled, [`MigrationDeltaCalculator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/MigrationDeltaCalculator.java) queries the primary database root table to plan data movements:
+   $$\text{Planned Shard} = \text{router.routeNode}(\text{rootTable}.\text{rootIdColumn})$$
+   It then copies the root row and joins all child tables using the `@ShardedKey` hop graph starting from that root ID.
+
+**The Fatal Failure Mode (Key Disconnect)**:
+If your service extracts a user ID (`"usr_999"` from JWT `sub`), but your `@ShardedRoot` table is `Organization` where `@ShardedKey` is `organizations.id` (`"org_123"`):
+- The service hashes `"usr_999"` and routes queries to **Shard 1**.
+- But the rebalancer hashed `"org_123"` and placed that organization's data on **Shard 2**!
+- Queries execute on Shard 1 looking for data that physically lives on Shard 2, resulting in missing records, foreign key violations, or empty query results.
+
+##### Recommended Best Practice Patterns
+
+###### Pattern 1: B2B Multi-Tenant SaaS (Partition by Tenant / Organization)
+In multi-tenant SaaS, all operational data belongs to an enterprise tenant (organization, workspace, company).
+
+- **Root Entity**:
+  ```java
+  @Entity
+  @Table(name = "organizations")
+  @ShardedRoot
+  public class Organization {
+      @Id
+      @ShardedKey
+      private String id; // Physical column: "id", value: "org_123"
+      
+      @ShardedStatus
+      private String syncStatus;
+  }
+  ```
+- **Key Extraction Strategy**:
+  - *Via JWT Claim (Recommended)*: Set `fractal.sharding.jwt.claim-name: tenant_id` (or `org_id`). Ensure your identity provider (Keycloak, Auth0, Okta) embeds the tenant identifier in the access token:
+    ```json
+    { "sub": "usr_abc", "tenant_id": "org_123", "roles": ["ADMIN"] }
+    ```
+    Service methods simply use `@Sharded` with zero arguments.
+  - *Via Method Parameter*: For background or internal batch jobs, pass the organization ID:
+    ```java
+    @Sharded(key = "#orgId")
+    public void generateReport(String orgId) { ... }
+    ```
+
+###### Pattern 2: B2C Consumer Platforms (Partition by User / Account)
+In consumer platforms (wallets, shopping carts, gaming), data belongs directly to individual end-users.
+
+- **Root Entity**:
+  ```java
+  @Entity
+  @Table(name = "users")
+  @ShardedRoot
+  public class User {
+      @Id
+      @ShardedKey
+      private String id; // Physical column: "id", value: "usr_456"
+      
+      @ShardedStatus
+      private String syncStatus;
+  }
+  ```
+- **Key Extraction Strategy**:
+  - *Via JWT Subject (Default)*: Keep the default configuration `fractal.sharding.jwt.claim-name: sub`. Standard OAuth2/OIDC tokens store the user's unique identifier in the `sub` claim:
+    ```json
+    { "sub": "usr_456", "email": "alice@example.com" }
+    ```
+    Service methods use `@Sharded` with zero arguments.
+  - *Via Method Parameter*:
+    ```java
+    @Sharded(key = "#userId")
+    public UserProfile updateProfile(String userId, ProfileDto dto) { ... }
+    ```
+
+---
+
 #### Replicated Reference Tables (`@ShardedReplica` & `@ShardedBroadcast`)
 
 For global reference data (e.g. currencies, tax rates) that sharded queries must join against locally:
