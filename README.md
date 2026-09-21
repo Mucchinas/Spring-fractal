@@ -358,12 +358,61 @@ For global reference data (e.g. currencies, tax rates) that sharded queries must
 3. **Execute Local Shard Joins**:
    ```java
    @Repository
-   public interface OrderRepository extends JpaRepository<Order, UUID> {
+   public interface OrderRepository extends ShardedRepository<Order, UUID> {
        // High-performance local SQL join on the physical shard (zero cross-database calls)
        @Query("SELECT o FROM Order o JOIN Currency c ON o.currency = c.code WHERE o.organization.id = :orgId")
        List<Order> findOrdersWithCurrency(@Param("orgId") String orgId);
    }
    ```
+
+---
+
+#### Sharded Repository Contract & Physical Schema Audit
+
+In horizontal sharding, tables located on worker shards **must maintain a foreign key path back to the `@ShardedRoot` table** (or be declared as `@ShardedReplica`). If an unlinked table is written to on a worker shard, its rows cannot be discovered during cluster rebalancing and would be permanently lost when a tenant is relocated to another shard!
+
+Fractal provides two complementary, fail-fast startup safety mechanisms:
+
+##### 1. Spring Data JPA: The `ShardedRepository` Pattern
+
+For applications using Spring Data JPA, repositories managing sharded data must extend [`ShardedRepository<T, ID>`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/repository/ShardedRepository.java) instead of `JpaRepository<T, ID>`:
+
+```java
+package com.example.repository;
+
+import io.github.mucchinas.fractal.repository.ShardedRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface OrderRepository extends ShardedRepository<Order, UUID> {
+    // Inherits all standard Spring Data JPA methods (save, findById, findAll, etc.)
+}
+```
+
+At application startup, [`ShardedRepositoryStartupValidator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/repository/ShardedRepositoryStartupValidator.java) enforces two strict invariants:
+- **Rule 1 (Entity Reachability Guard)**: Any entity `T` managed by a `ShardedRepository` must be annotated with `@ShardedRoot`, `@ShardedReplica`, or `@ShardedEntity` with an introspected path connecting it to root. If an unannotated or orphaned entity is used, startup fails immediately.
+- **Rule 2 (Service Injection Guard)**: Services annotated with `@Sharded` (or containing `@Sharded` methods) **must only inject repositories extending `ShardedRepository`**. Attempting to inject a standard `JpaRepository` into a sharded service triggers a validation failure, preventing accidental writes to unmanaged tables while routed to physical shards.
+- **Coordinator Repository Whitelisting**: If a `@Sharded` service legitimately needs to inject a coordinator-only repository (e.g. `BillingPlanRepository` on the central primary database), add it to `fractal.sharding.validation.allowed-non-sharded-repositories`.
+
+##### 2. Non-JPA / JDBC / MyBatis: Physical Shard Schema Audit
+
+For teams using pure JDBC, jOOQ, or MyBatis (or as an additional layer of physical defense), Fractal's [`PhysicalSchemaAuditValidator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/PhysicalSchemaAuditValidator.java) queries `information_schema.tables` directly on every **active physical worker shard database**:
+- Any physical table residing on a worker shard that lacks an FK path to the root table (and is neither a replica nor an excluded table) triggers a startup failure.
+- **Primary Database Isolation**: Central coordinator tables existing **only on the `primary` database** (such as `system_config`, `flyway_schema_history`, or `global_billing_plans`) are completely permitted and are **not** flagged by the shard schema audit.
+
+##### Configuration:
+
+```yaml
+fractal:
+  sharding:
+    validation:
+      repository-enforcement: STRICT   # STRICT (fail startup) | WARN (log warning) | DISABLED
+      schema-audit-action: STRICT      # STRICT (fail startup) | WARN (log warning) | DISABLED
+      allowed-non-sharded-repositories:
+        - CentralBillingPlanRepo       # Allow coordinator repository inside @Sharded service
+      schema-audit-exclude-tables:
+        - temp_import_staging          # Ignore temporary/ETL physical tables on shards
+```
 
 ## Online Shard Rebalancing & Dynamic Dual-Ring Routing
 
@@ -594,7 +643,7 @@ For advanced topics, architectural diagrams, and enterprise deployment scenarios
 | **[5. Configuration Reference](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#5-configuration-property-specifications)** | Exhaustive property matrix and fully documented `application.yml` template |
 | **[6. Advanced Usage & Patterns](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#6-advanced-usage--integration-patterns)** | Custom `ShardingKeyExtractor`, JWT claim types, HTTP header extraction |
 | **[7. Pitfalls & Architecture Solutions](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#7-technical-considerations-pitfalls--solutions)** | Schema management, multi-datasource joins, the Transaction Aggregation Problem & `REQUIRES_NEW` dangers |
-| **[8. Verification & Test Suite](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#8-verification-testing--test-suite-reference)** | Coverage breakdown across all 34 test suites (113 automated unit/integration tests) |
+| **[8. Verification & Test Suite](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/DEEP_DIVE.md#8-verification-testing--test-suite-reference)** | Coverage breakdown across all 37 test suites (132 automated unit/integration tests) |
 
 ---
 
@@ -605,7 +654,7 @@ For advanced topics, architectural diagrams, and enterprise deployment scenarios
 - Apache Maven 3.8+
 
 ### Execution
-Run the full test suite (113 unit and integration tests):
+Run the full test suite (132 unit and integration tests):
 
 ```bash
 mvn clean test

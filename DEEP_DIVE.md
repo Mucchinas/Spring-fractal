@@ -1318,6 +1318,10 @@ All properties are rooted under `fractal.sharding`:
 | `fractal.sharding.rebalancer.sharded-tables` | `List<String>` | `null` | Optional explicit list of sharded tables. Discovered automatically from `@ShardedRoot` / `@ShardedEntity` domain models or foreign key graph. |
 | `fractal.sharding.rebalancer.replica-tables` | `List<String>` | `null` | Optional explicit list of reference tables to replicate across all shards. Inferred from `@ShardedReplica` or catalog when `shard-all: true`. |
 | `fractal.sharding.rebalancer.exclude-tables` | `List<String>` | `null` | Optional list of tables to exclude from auto-discovery. |
+| `fractal.sharding.validation.repository-enforcement` | `EnforcementMode` | `WARN` | Enforcement mode for Spring Data JPA repositories (`STRICT`, `WARN`, `DISABLED`). Enforces that entities managed by `ShardedRepository` are sharded, and `@Sharded` services only inject `ShardedRepository`. |
+| `fractal.sharding.validation.schema-audit-action` | `EnforcementMode` | `WARN` | Enforcement mode for physical shard schema audit (`STRICT`, `WARN`, `DISABLED`). Audits physical worker shards for unlinked tables. |
+| `fractal.sharding.validation.allowed-non-sharded-repositories` | `List<String>` | `[]` | Whitelist of repository bean or class names permitted inside `@Sharded` services (e.g. primary coordinator tables). |
+| `fractal.sharding.validation.schema-audit-exclude-tables` | `List<String>` | `[]` | Physical tables residing on worker shards to exclude from the unlinked schema audit. |
 
 ---
 
@@ -1377,6 +1381,13 @@ fractal:
       exclude-tables:
         - flyway_schema_history
         - spatial_ref_sys
+    validation:
+      repository-enforcement: STRICT   # STRICT | WARN | DISABLED
+      schema-audit-action: STRICT      # STRICT | WARN | DISABLED
+      allowed-non-sharded-repositories:
+        - CentralBillingPlanRepo       # Allow coordinator repository inside @Sharded service
+      schema-audit-exclude-tables:
+        - temp_staging_import          # Ignore temporary physical tables on worker shards
 ```
 
 ---
@@ -2074,8 +2085,11 @@ Attempting to bypass routing lock-in using `@Transactional(propagation = Propaga
 mvn clean test
 ```
 
-The test suite rigorously validates the starter across 34 test classes covering 113 automated test cases, specifically designed to prevent false positives and verify physical database operations:
+The test suite rigorously validates the starter across 37 test classes covering 132 automated test cases, specifically designed to prevent false positives and verify physical database operations:
 
+- [`ShardedRepositoryContractTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/repository/ShardedRepositoryContractTest.java): Validates Spring Data JPA `ShardedRepository<T, ID>` entity contracts, asserting that managing unannotated entities fails startup in STRICT mode, managing `@ShardedEntity` instances without reachability to `@ShardedRoot` fails startup, managing `@ShardedRoot` and `@ShardedReplica` passes, and verifying WARN/DISABLED modes.
+- [`ShardedServiceInjectionValidationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/repository/ShardedServiceInjectionValidationTest.java): Validates service-level repository injection constraints, asserting that `@Sharded` classes or methods injecting standard non-sharded `JpaRepository` beans fail startup in STRICT mode, verifying that whitelisted repositories in `allowed-non-sharded-repositories` pass, and verifying that coordinator services without `@Sharded` annotations are permitted to inject standard repositories.
+- [`PhysicalSchemaAuditValidatorTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/PhysicalSchemaAuditValidatorTest.java): Validates physical shard database schema introspection for non-JPA/JDBC environments, asserting that unlinked physical tables residing on worker shards fail startup in STRICT mode, verifying exclusion via `schema-audit-exclude-tables`, replica bypass via `replica-tables`, and asserting that central coordinator tables existing exclusively on the primary database are safely ignored.
 - [`DualRingMigrationRoutingTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/DualRingMigrationRoutingTest.java): Asserts dynamic dual-ring routing during active rebalancing (pending tenants route to old source shard, active migrating tenant throws `TenantMigratingException`, completed tenants immediately cut over to new ring shard, non-migrating bystanders route unaffected), zero-overhead fast path in steady state, and Caffeine caching of global rebalance status.
 - [`ShardDecommissioningTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/ShardDecommissioningTest.java): Tests the end-to-end cluster contraction lifecycle ($M \to N$), verifying that decommissioning shards are excluded from the active ring, their tenants are safely migrated to surviving shards, and the shard is automatically deregistered from topology upon completion.
 - [`PrimaryDrainMigrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/PrimaryDrainMigrationTest.java): Tests brownfield onboarding via `primary.drain: true`, verifying that all child tables are evacuated from the primary database to worker shards, root table records are retained with `ACTIVE` status, and the primary shard lifecycle transitions cleanly from `DRAINING` to `DRAINED`.

@@ -365,7 +365,7 @@ public class TableDependencyResolver {
         return new TableMigrationPlan(table, selectSql, deleteSql);
     }
 
-    private List<TableForeignKey> findPathToRoot(String startTable, String rootTable, List<TableForeignKey> allFks) {
+    public List<TableForeignKey> findPathToRoot(String startTable, String rootTable, List<TableForeignKey> allFks) {
         Queue<List<TableForeignKey>> queue = new LinkedList<>();
         for (TableForeignKey fk : allFks) {
             if (fk.childTable().equalsIgnoreCase(startTable)) {

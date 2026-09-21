@@ -18,6 +18,33 @@ public class FractalProperties {
     private Map<String, DataSourceProperties> shards;
     private RebalancerProperties rebalancer = new RebalancerProperties();
     private JwtProperties jwt = new JwtProperties();
+    private ValidationProperties validation = new ValidationProperties();
+
+    public ValidationProperties getValidation() { return validation; }
+    public void setValidation(ValidationProperties validation) { this.validation = validation != null ? validation : new ValidationProperties(); }
+
+    public static class ValidationProperties {
+        private EnforcementMode repositoryEnforcement = EnforcementMode.WARN;
+        private EnforcementMode schemaAuditAction = EnforcementMode.WARN;
+        private List<String> allowedNonShardedRepositories = new ArrayList<>();
+        private List<String> schemaAuditExcludeTables = new ArrayList<>();
+
+        public enum EnforcementMode {
+            STRICT, WARN, DISABLED
+        }
+
+        public EnforcementMode getRepositoryEnforcement() { return repositoryEnforcement; }
+        public void setRepositoryEnforcement(EnforcementMode repositoryEnforcement) { this.repositoryEnforcement = repositoryEnforcement != null ? repositoryEnforcement : EnforcementMode.WARN; }
+
+        public EnforcementMode getSchemaAuditAction() { return schemaAuditAction; }
+        public void setSchemaAuditAction(EnforcementMode schemaAuditAction) { this.schemaAuditAction = schemaAuditAction != null ? schemaAuditAction : EnforcementMode.WARN; }
+
+        public List<String> getAllowedNonShardedRepositories() { return allowedNonShardedRepositories; }
+        public void setAllowedNonShardedRepositories(List<String> allowedNonShardedRepositories) { this.allowedNonShardedRepositories = allowedNonShardedRepositories != null ? allowedNonShardedRepositories : new ArrayList<>(); }
+
+        public List<String> getSchemaAuditExcludeTables() { return schemaAuditExcludeTables; }
+        public void setSchemaAuditExcludeTables(List<String> schemaAuditExcludeTables) { this.schemaAuditExcludeTables = schemaAuditExcludeTables != null ? schemaAuditExcludeTables : new ArrayList<>(); }
+    }
 
     public JwtProperties getJwt() { return jwt; }
     public void setJwt(JwtProperties jwt) { this.jwt = jwt; }

@@ -23,6 +23,8 @@ import io.github.mucchinas.fractal.provisioning.TenantInitializer;
 import io.github.mucchinas.fractal.provisioning.TenantProvisioner;
 import io.github.mucchinas.fractal.rebalance.EntityMetadataResult;
 import io.github.mucchinas.fractal.rebalance.EntityTableMetadataResolver;
+import io.github.mucchinas.fractal.repository.ShardedRepositoryStartupValidator;
+import io.github.mucchinas.fractal.rebalance.PhysicalSchemaAuditValidator;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -204,6 +206,24 @@ public class FractalAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean
+    public PhysicalSchemaAuditValidator physicalSchemaAuditValidator(DataSource dataSource,
+                                                                     FractalProperties properties,
+                                                                     TableDependencyResolver dependencyResolver) {
+        Map<String, DataSource> shards = resolveShardDataSources(dataSource, properties);
+        return new PhysicalSchemaAuditValidator(shards, properties, dependencyResolver);
+    }
+
+    @Bean
+    @ConditionalOnClass(name = "org.springframework.data.jpa.repository.JpaRepository")
+    @ConditionalOnMissingBean
+    public ShardedRepositoryStartupValidator shardedRepositoryStartupValidator(ApplicationContext applicationContext,
+                                                                               FractalProperties properties,
+                                                                               ObjectProvider<EntityTableMetadataResolver> metadataResolverProvider) {
+        return new ShardedRepositoryStartupValidator(applicationContext, properties, metadataResolverProvider);
+    }
+
+    @Bean
     public CommandLineRunner fractalStartupListener(TopologyManager topologyManager,
                                                      TableDependencyResolver dependencyResolver,
                                                      RebalanceEngine rebalanceEngine,
@@ -211,6 +231,8 @@ public class FractalAutoConfiguration {
                                                      FractalProperties properties,
                                                      EntityTableMetadataResolver entityMetadataResolver,
                                                      ReplicaTableSynchronizer replicaTableSynchronizer,
+                                                     ObjectProvider<ShardedRepositoryStartupValidator> shardedRepositoryValidatorProvider,
+                                                     ObjectProvider<PhysicalSchemaAuditValidator> physicalSchemaAuditValidatorProvider,
                                                      DataSource dataSource) {
         return args -> {
             if (properties.getRebalancer().isShardAll()) {
@@ -267,6 +289,16 @@ public class FractalAutoConfiguration {
                     log.warn("FRACTAL: Warning during entity metadata resolution: {}", e.getMessage());
                 }
             }
+
+            ShardedRepositoryStartupValidator repoValidator = shardedRepositoryValidatorProvider.getIfAvailable();
+            if (repoValidator != null) {
+                repoValidator.validate();
+            }
+            PhysicalSchemaAuditValidator schemaAuditValidator = physicalSchemaAuditValidatorProvider.getIfAvailable();
+            if (schemaAuditValidator != null) {
+                schemaAuditValidator.validate();
+            }
+
             replicaTableSynchronizer.syncAllReplicaTables(properties.getRebalancer().getReplicaTables());
 
             if (properties.getRebalancer().isEnabled()) {
