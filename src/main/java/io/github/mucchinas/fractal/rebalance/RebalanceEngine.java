@@ -3,20 +3,28 @@ package io.github.mucchinas.fractal.rebalance;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import io.github.mucchinas.fractal.config.FractalProperties;
+import io.github.mucchinas.fractal.core.ConsistentHashRouter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 
 import javax.sql.DataSource;
+import java.time.Duration;
 import java.util.*;
 
-public class RebalanceEngine {
+public class RebalanceEngine implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(RebalanceEngine.class);
 
     private final JdbcTemplate primaryJdbcTemplate;
     private final TableDependencyResolver dependencyResolver;
     private final TopologyManager topologyManager;
     private final FractalProperties.RebalancerProperties props;
     private final Map<String, NamedParameterJdbcTemplate> shardTemplates = new HashMap<>();
+    private final List<AutoCloseable> internalDataSources = new ArrayList<>();
+    private volatile ConsistentHashRouter router;
 
     public RebalanceEngine(DataSource primaryDataSource,
                            TableDependencyResolver dependencyResolver,
@@ -32,10 +40,14 @@ public class RebalanceEngine {
         if (properties != null && properties.getShards() != null) {
             properties.getShards().forEach((name, dbProps) -> {
                 HikariConfig config = new HikariConfig();
+                config.setPoolName("HikariPool-rebalance-" + name);
                 config.setJdbcUrl(dbProps.getJdbcUrl());
                 config.setUsername(dbProps.getUsername());
                 config.setPassword(dbProps.getPassword());
-                this.shardTemplates.put(name, new NamedParameterJdbcTemplate(new HikariDataSource(config)));
+                config.setConnectionTestQuery("SELECT 1");
+                HikariDataSource ds = new HikariDataSource(config);
+                this.internalDataSources.add(ds);
+                this.shardTemplates.put(name, new NamedParameterJdbcTemplate(ds));
             });
         }
     }
@@ -44,7 +56,7 @@ public class RebalanceEngine {
                            TableDependencyResolver dependencyResolver,
                            TopologyManager topologyManager,
                            FractalProperties.RebalancerProperties props) {
-        this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
+        this.primaryJdbcTemplate = primaryDataSource != null ? new JdbcTemplate(primaryDataSource) : null;
         this.dependencyResolver = dependencyResolver;
         this.topologyManager = topologyManager;
         this.props = props != null ? props : new FractalProperties.RebalancerProperties();
@@ -90,26 +102,30 @@ public class RebalanceEngine {
             for (MigrationDeltaCalculator.MigrationAction action : actions) {
                 String userId = action.userId();
                 try {
-                    System.out.println("FRACTAL: Migrazione utente " + userId +
-                            " da " + action.sourceShard() + " a " + action.targetShard());
+                    log.info("FRACTAL: Migrating tenant {} from {} to {}", userId, action.sourceShard(), action.targetShard());
                     if (topologyManager != null) {
                         topologyManager.markTenantMigrating(userId);
                     }
                     setTenantStatus(userId, props.getMigratingValue());
                     if (topologyManager != null) {
-                        java.time.Duration drainTimeout = props.getDrainTimeout() != null ? props.getDrainTimeout() : java.time.Duration.ofSeconds(10);
+                        Duration drainTimeout = props.getDrainTimeout() != null ? props.getDrainTimeout() : Duration.ofSeconds(10);
                         boolean drained = topologyManager.awaitTenantQuiescence(userId, drainTimeout);
                         if (!drained) {
-                            System.err.println("FRACTAL: In-flight requests for tenant " + userId +
-                                    " did not drain within " + drainTimeout + ". Deferring migration.");
+                            log.warn("FRACTAL: In-flight requests for tenant {} did not drain within {}. Deferring migration.", userId, drainTimeout);
                             setTenantStatus(userId, props.getActiveValue());
                             topologyManager.markTenantActive(userId);
                             continue;
                         }
                     }
-                    if (props.getQuiescencePeriod() != null && !props.getQuiescencePeriod().isZero() && !props.getQuiescencePeriod().isNegative()) {
+
+                    Duration quiescence = props.getQuiescencePeriod();
+                    if (quiescence != null && !quiescence.isZero() && !quiescence.isNegative()) {
+                        long sleepMillis = quiescence.toMillis();
+                        if (props.getStatusCacheTtl() != null && props.getStatusCacheTtl().toMillis() > sleepMillis) {
+                            sleepMillis = props.getStatusCacheTtl().toMillis();
+                        }
                         try {
-                            Thread.sleep(props.getQuiescencePeriod().toMillis());
+                            Thread.sleep(sleepMillis);
                         } catch (InterruptedException e) {
                             Thread.currentThread().interrupt();
                         }
@@ -119,9 +135,10 @@ public class RebalanceEngine {
                     NamedParameterJdbcTemplate target = shardTemplates.get(action.targetShard());
 
                     if (source == null || target == null) {
-                        System.err.println("FRACTAL: Shard non trovato: source=" + action.sourceShard() + ", target=" + action.targetShard());
+                        log.error("FRACTAL: Shard not found: source={}, target={}", action.sourceShard(), action.targetShard());
                         setTenantStatus(userId, props.getActiveValue());
                         if (topologyManager != null) {
+                            topologyManager.clearMigrationRecord(userId);
                             topologyManager.markTenantActive(userId);
                         }
                         continue;
@@ -132,9 +149,9 @@ public class RebalanceEngine {
                     boolean targetHasData = hasRootRecord(userId, props.getRootTable(), props.getRootIdColumn(), target);
 
                     if (!sourceHasData && targetHasData) {
-                        System.out.println("FRACTAL: Utente " + userId + " già presente su " + action.targetShard() + ", migrazione già completata.");
+                        log.info("FRACTAL: Tenant {} already present on {}, migration already completed.", userId, action.targetShard());
                     } else if (TopologyManager.PHASE_PRUNING.equalsIgnoreCase(existingPhase)) {
-                        System.out.println("FRACTAL: Ripresa migrazione da fase PRUNING per " + userId);
+                        log.info("FRACTAL: Resuming migration from PRUNING phase for tenant {}", userId);
                         for (TableMigrationPlan plan : deletePlans) {
                             if (action.sourceShard().equalsIgnoreCase(TopologyManager.PRIMARY_SHARD_NAME)
                                     && plan.tableName().equalsIgnoreCase(props.getRootTable())) {
@@ -170,11 +187,33 @@ public class RebalanceEngine {
                     if (topologyManager != null) {
                         topologyManager.markTenantActive(userId);
                     }
-                    System.out.println("FRACTAL: Migrazione completata per " + userId);
+                    log.info("FRACTAL: Migration completed for tenant {}", userId);
 
                 } catch (Exception e) {
-                    System.err.println("FRACTAL: Errore critico durante la migrazione di " + userId);
-                    e.printStackTrace();
+                    log.error("FRACTAL: Critical error during migration of tenant {}", userId, e);
+                    try {
+                        String currentPhase = topologyManager != null ? topologyManager.getMigrationPhase(userId) : null;
+                        if (!TopologyManager.PHASE_PRUNING.equalsIgnoreCase(currentPhase)) {
+                            NamedParameterJdbcTemplate target = shardTemplates.get(action.targetShard());
+                            if (target != null) {
+                                for (TableMigrationPlan plan : deletePlans) {
+                                    try {
+                                        deleteTableData(userId, plan, target);
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                            }
+                            if (topologyManager != null) {
+                                topologyManager.clearMigrationRecord(userId);
+                            }
+                        }
+                        setTenantStatus(userId, props.getActiveValue());
+                        if (topologyManager != null) {
+                            topologyManager.markTenantActive(userId);
+                        }
+                    } catch (Exception rollbackEx) {
+                        log.error("FRACTAL: Error during rollback for tenant {}", userId, rollbackEx);
+                    }
                 }
             }
         } finally {
@@ -185,7 +224,7 @@ public class RebalanceEngine {
     }
 
     private void setTenantStatus(String userId, String status) {
-        if (props.getRootTable() != null && props.getRootIdColumn() != null && props.getStatusColumn() != null) {
+        if (primaryJdbcTemplate != null && props.getRootTable() != null && props.getRootIdColumn() != null && props.getStatusColumn() != null) {
             String sql = String.format("UPDATE %s SET %s = ? WHERE %s = ?",
                     props.getRootTable(), props.getStatusColumn(), props.getRootIdColumn());
             primaryJdbcTemplate.update(sql, status, userId);
@@ -236,5 +275,46 @@ public class RebalanceEngine {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    public ConsistentHashRouter getRouter() {
+        return router;
+    }
+
+    public void setRouter(ConsistentHashRouter router) {
+        this.router = router;
+    }
+
+    /**
+     * Evacuates a single newly provisioned tenant from primary database to its assigned target shard at runtime.
+     */
+    public void drainTenantFromPrimary(String tenantId) {
+        if (tenantId == null || tenantId.isBlank()) return;
+        if (router == null) {
+            throw new IllegalStateException("Router not initialized in RebalanceEngine");
+        }
+        String targetShard = router.routeNode(tenantId);
+        if (targetShard == null) {
+            throw new IllegalStateException("No active shard available for tenant " + tenantId);
+        }
+        drainTenantFromPrimary(tenantId, targetShard);
+    }
+
+    public void drainTenantFromPrimary(String tenantId, String targetShard) {
+        if (tenantId == null || tenantId.isBlank() || targetShard == null) return;
+        executeMigration(List.of(
+                new MigrationDeltaCalculator.MigrationAction(tenantId, TopologyManager.PRIMARY_SHARD_NAME, targetShard)
+        ));
+    }
+
+    @Override
+    public void close() {
+        for (AutoCloseable ac : internalDataSources) {
+            try {
+                ac.close();
+            } catch (Exception ignored) {
+            }
+        }
+        internalDataSources.clear();
     }
 }

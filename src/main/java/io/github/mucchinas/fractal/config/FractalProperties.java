@@ -24,6 +24,7 @@ public class FractalProperties {
 
     public static class JwtProperties {
         private String claimName = "sub";
+        private Map<String, String> attributeClaims = new java.util.HashMap<>();
 
         public String getClaimName() {
             return claimName;
@@ -31,6 +32,14 @@ public class FractalProperties {
 
         public void setClaimName(String claimName) {
             this.claimName = claimName;
+        }
+
+        public Map<String, String> getAttributeClaims() {
+            return attributeClaims;
+        }
+
+        public void setAttributeClaims(Map<String, String> attributeClaims) {
+            this.attributeClaims = attributeClaims != null ? attributeClaims : new java.util.HashMap<>();
         }
     }
 
@@ -263,6 +272,12 @@ public class FractalProperties {
         this.virtualNodes = virtualNodes;
     }
 
+    public enum DrainCheckMode {
+        COUNT_THEN_PROBE,
+        PROBE_ONLY,
+        FULL_STREAMING
+    }
+
     public static class DataSourceProperties {
 
         private String jdbcUrl;
@@ -271,6 +286,9 @@ public class FractalProperties {
         private boolean initializeSchema = true;
         private boolean decommission = false;
         private boolean drain = false;
+        private boolean continuousDrain = true;
+        private int drainBatchSize = 5000;
+        private DrainCheckMode drainCheckMode = DrainCheckMode.COUNT_THEN_PROBE;
         private String status;
 
         public boolean isDrain() {
@@ -279,6 +297,30 @@ public class FractalProperties {
 
         public void setDrain(boolean drain) {
             this.drain = drain;
+        }
+
+        public boolean isContinuousDrain() {
+            return continuousDrain;
+        }
+
+        public void setContinuousDrain(boolean continuousDrain) {
+            this.continuousDrain = continuousDrain;
+        }
+
+        public int getDrainBatchSize() {
+            return drainBatchSize;
+        }
+
+        public void setDrainBatchSize(int drainBatchSize) {
+            this.drainBatchSize = drainBatchSize;
+        }
+
+        public DrainCheckMode getDrainCheckMode() {
+            return drainCheckMode;
+        }
+
+        public void setDrainCheckMode(DrainCheckMode drainCheckMode) {
+            this.drainCheckMode = drainCheckMode != null ? drainCheckMode : DrainCheckMode.COUNT_THEN_PROBE;
         }
 
         public boolean isDecommission() {

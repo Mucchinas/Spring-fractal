@@ -6,6 +6,9 @@ import io.github.mucchinas.fractal.core.ShardContextHolder;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.aop.support.AopUtils;
+import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.core.annotation.Order;
 
 import java.util.Set;
@@ -26,30 +29,34 @@ public class ShardedBroadcastAspect {
 
     @Around("@annotation(io.github.mucchinas.fractal.annotation.ShardedBroadcast) || @within(io.github.mucchinas.fractal.annotation.ShardedBroadcast)")
     public Object broadcast(ProceedingJoinPoint joinPoint) throws Throwable {
-        org.aspectj.lang.reflect.MethodSignature signature = (org.aspectj.lang.reflect.MethodSignature) joinPoint.getSignature();
-        ShardedBroadcast shardedBroadcast = signature.getMethod().getAnnotation(ShardedBroadcast.class);
-        if (shardedBroadcast == null) {
-            shardedBroadcast = joinPoint.getTarget().getClass().getAnnotation(ShardedBroadcast.class);
+        MethodSignature signature = (MethodSignature) joinPoint.getSignature();
+        ShardedBroadcast shardedBroadcast = AnnotationUtils.findAnnotation(signature.getMethod(), ShardedBroadcast.class);
+        if (shardedBroadcast == null && joinPoint.getTarget() != null) {
+            shardedBroadcast = AnnotationUtils.findAnnotation(AopUtils.getTargetClass(joinPoint.getTarget()), ShardedBroadcast.class);
         }
         boolean includePrimary = shardedBroadcast == null || shardedBroadcast.includePrimary();
 
-        Object result = null;
-        if (includePrimary) {
-            ShardContextHolder.clear();
-            result = joinPoint.proceed();
-        }
-        for (String shardName : shardNames) {
-            try {
+        String previousShard = ShardContextHolder.getShard();
+        try {
+            Object result = null;
+            if (includePrimary) {
+                ShardContextHolder.clear();
+                result = joinPoint.proceed();
+            }
+            for (String shardName : shardNames) {
                 ShardContextHolder.setShard(shardName);
                 Object shardResult = joinPoint.proceed();
                 if (!includePrimary && result == null) {
                     result = shardResult;
                 }
-            } finally {
+            }
+            return result;
+        } finally {
+            if (previousShard != null) {
+                ShardContextHolder.setShard(previousShard);
+            } else {
                 ShardContextHolder.clear();
             }
         }
-
-        return result;
     }
 }

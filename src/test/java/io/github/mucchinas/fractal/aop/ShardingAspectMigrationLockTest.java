@@ -57,6 +57,7 @@ class ShardingAspectMigrationLockTest {
     void tearDown() {
         ShardContextHolder.clear();
         topologyManager.markTenantActive("tenant-locked");
+        topologyManager.markTenantActive("tenant-restored");
     }
 
     @Test

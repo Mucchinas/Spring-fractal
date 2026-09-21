@@ -12,6 +12,9 @@ public class ConsistentHashRouter {
     private final SortedMap<Long, String> ring = new TreeMap<>();
 
     public ConsistentHashRouter(Collection<String> shardNames, int numberOfVirtualNodes) {
+        if (numberOfVirtualNodes <= 0) {
+            throw new IllegalArgumentException("numberOfVirtualNodes must be greater than 0, got: " + numberOfVirtualNodes);
+        }
         if (shardNames != null) {
             for (String shardName : shardNames) {
                 if (shardName != null && !shardName.isBlank()) {
@@ -54,7 +57,7 @@ public class ConsistentHashRouter {
                     | ((long) (digest[1] & 0xFF) << 8)
                     | ((long) (digest[0] & 0xFF));
         } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("Algoritmo MD5 non supportato dal sistema", e);
+            throw new IllegalStateException("MD5 algorithm not supported by environment", e);
         }
     }
 }

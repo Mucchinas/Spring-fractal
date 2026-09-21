@@ -8,12 +8,19 @@ import io.github.mucchinas.fractal.aop.ShardedBroadcastAspect;
 import io.github.mucchinas.fractal.core.ConsistentHashRouter;
 import io.github.mucchinas.fractal.core.ShardingKeyExtractor;
 import io.github.mucchinas.fractal.datasource.ShardingRoutingDataSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import io.github.mucchinas.fractal.rebalance.MigrationDeltaCalculator;
 import io.github.mucchinas.fractal.rebalance.RebalanceEngine;
 import io.github.mucchinas.fractal.rebalance.ReplicaTableSynchronizer;
 import io.github.mucchinas.fractal.rebalance.TableDependencyResolver;
 import io.github.mucchinas.fractal.rebalance.TopologyManager;
+import io.github.mucchinas.fractal.provisioning.DefaultTenantProvisioner;
+import io.github.mucchinas.fractal.provisioning.RootEntityAttributeExtractor;
+import io.github.mucchinas.fractal.provisioning.RootEntityCustomizer;
+import io.github.mucchinas.fractal.provisioning.TenantInitializer;
+import io.github.mucchinas.fractal.provisioning.TenantProvisioner;
 import io.github.mucchinas.fractal.rebalance.EntityMetadataResult;
 import io.github.mucchinas.fractal.rebalance.EntityTableMetadataResolver;
 import org.springframework.boot.CommandLineRunner;
@@ -42,6 +49,8 @@ import java.util.Set;
 @ConditionalOnProperty(prefix = "fractal.sharding", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class FractalAutoConfiguration {
 
+    private static final Logger log = LoggerFactory.getLogger(FractalAutoConfiguration.class);
+
     @Bean
     @ConditionalOnMissingBean
     public ConsistentHashRouter consistentHashRouter(FractalProperties properties) {
@@ -60,8 +69,9 @@ public class FractalAutoConfiguration {
     public ShardingAspect shardingAspect(ConsistentHashRouter router,
                                          ObjectProvider<ShardingKeyExtractor> extractors,
                                          ObjectProvider<TopologyManager> topologyManagerProvider,
-                                         ObjectProvider<FractalProperties> propertiesProvider) {
-        return new ShardingAspect(router, extractors, topologyManagerProvider, propertiesProvider);
+                                         ObjectProvider<FractalProperties> propertiesProvider,
+                                         ObjectProvider<TenantProvisioner> tenantProvisionerProvider) {
+        return new ShardingAspect(router, extractors, topologyManagerProvider, propertiesProvider, tenantProvisionerProvider);
     }
 
     @Bean
@@ -69,16 +79,21 @@ public class FractalAutoConfiguration {
     public DataSource dataSource(FractalProperties properties) {
         ShardingRoutingDataSource routingDataSource = new ShardingRoutingDataSource();
 
-        DataSource primaryDataSource = buildDataSource(properties.getPrimary());
-
+        DataSource primaryDataSource = buildDataSource(TopologyManager.PRIMARY_SHARD_NAME, properties.getPrimary());
+        Map<String, DataSource> shardDataSources = new HashMap<>();
         Map<Object, Object> targetDataSources = new HashMap<>();
+
         targetDataSources.put(TopologyManager.PRIMARY_SHARD_NAME, primaryDataSource);
         if (properties.getShards() != null) {
-            properties.getShards().forEach((name, props) ->
-                    targetDataSources.put(name, buildDataSource(props))
-            );
+            properties.getShards().forEach((name, props) -> {
+                DataSource ds = buildDataSource(name, props);
+                shardDataSources.put(name, ds);
+                targetDataSources.put(name, ds);
+            });
         }
 
+        routingDataSource.setPrimaryDataSource(primaryDataSource);
+        routingDataSource.setShardDataSources(shardDataSources);
         routingDataSource.setDefaultTargetDataSource(primaryDataSource);
         routingDataSource.setTargetDataSources(targetDataSources);
         routingDataSource.afterPropertiesSet();
@@ -88,8 +103,8 @@ public class FractalAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public TopologyManager topologyManager(FractalProperties properties) {
-        DataSource primary = buildDataSource(properties.getPrimary());
+    public TopologyManager topologyManager(FractalProperties properties, DataSource dataSource) {
+        DataSource primary = resolvePrimaryDataSource(dataSource, properties);
         boolean autoInitSchema = properties.getPrimary() == null || properties.getPrimary().isInitializeSchema();
         java.time.Duration cacheTtl = properties.getRebalancer() != null ? properties.getRebalancer().getStatusCacheTtl() : java.time.Duration.ofSeconds(2);
         long cacheMaxSize = properties.getRebalancer() != null ? properties.getRebalancer().getStatusCacheMaxSize() : 50_000L;
@@ -119,8 +134,9 @@ public class FractalAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean
     public TableDependencyResolver tableDependencyResolver(FractalProperties properties,
-                                                           EntityTableMetadataResolver entityMetadataResolver) {
-        DataSource primary = buildDataSource(properties.getPrimary());
+                                                           EntityTableMetadataResolver entityMetadataResolver,
+                                                           DataSource dataSource) {
+        DataSource primary = resolvePrimaryDataSource(dataSource, properties);
         if (properties.getRebalancer().isShardAll()) {
             return new TableDependencyResolver(primary);
         }
@@ -128,7 +144,7 @@ public class FractalAutoConfiguration {
         try {
             entityResult = entityMetadataResolver.resolve();
         } catch (Exception e) {
-            System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
+            log.warn("FRACTAL: Warning during entity metadata resolution: {}", e.getMessage());
         }
         if (entityResult != null && !entityResult.foreignKeys().isEmpty()) {
             return new TableDependencyResolver(primary, entityResult.foreignKeys());
@@ -138,18 +154,47 @@ public class FractalAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    public RebalanceEngine rebalanceEngine(FractalProperties properties,
-                                           TableDependencyResolver dependencyResolver,
-                                           TopologyManager topologyManager) {
-        DataSource primary = buildDataSource(properties.getPrimary());
-        return new RebalanceEngine(primary, dependencyResolver, topologyManager, properties);
+    public RootEntityAttributeExtractor rootEntityAttributeExtractor(FractalProperties properties,
+                                                                     EntityTableMetadataResolver entityTableMetadataResolver) {
+        return new RootEntityAttributeExtractor(properties, entityTableMetadataResolver);
     }
 
     @Bean
     @ConditionalOnMissingBean
-    public ReplicaTableSynchronizer replicaTableSynchronizer(FractalProperties properties) {
-        DataSource primary = buildDataSource(properties.getPrimary());
-        return new ReplicaTableSynchronizer(primary, properties);
+    public TenantProvisioner tenantProvisioner(DataSource dataSource,
+                                               FractalProperties properties,
+                                               ConsistentHashRouter consistentHashRouter,
+                                               RootEntityAttributeExtractor attributeExtractor,
+                                               ObjectProvider<TenantInitializer> tenantInitializers,
+                                               ObjectProvider<RootEntityCustomizer> rootEntityCustomizers) {
+        DataSource primary = resolvePrimaryDataSource(dataSource, properties);
+        Map<String, DataSource> shards = resolveShardDataSources(dataSource, properties);
+        return new DefaultTenantProvisioner(primary, shards, consistentHashRouter, properties, attributeExtractor, tenantInitializers, rootEntityCustomizers);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public RebalanceEngine rebalanceEngine(FractalProperties properties,
+                                           TableDependencyResolver dependencyResolver,
+                                           TopologyManager topologyManager,
+                                           DataSource dataSource) {
+        DataSource primary = resolvePrimaryDataSource(dataSource, properties);
+        Map<String, DataSource> shards = resolveShardDataSources(dataSource, properties);
+        RebalanceEngine engine = new RebalanceEngine(primary, shards, dependencyResolver, topologyManager, properties.getRebalancer());
+        Set<String> activeShards = properties.getActiveShardNames();
+        if (!activeShards.isEmpty()) {
+            engine.setRouter(new ConsistentHashRouter(activeShards, properties.getVirtualNodes()));
+        }
+        return engine;
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public ReplicaTableSynchronizer replicaTableSynchronizer(FractalProperties properties,
+                                                             DataSource dataSource) {
+        DataSource primary = resolvePrimaryDataSource(dataSource, properties);
+        Map<String, DataSource> shards = resolveShardDataSources(dataSource, properties);
+        return new ReplicaTableSynchronizer(primary, shards, properties.getRebalancer(), properties.getDecommissioningShardNames());
     }
 
     @Bean
@@ -165,7 +210,8 @@ public class FractalAutoConfiguration {
                                                      ThreadPoolTaskExecutor fractalRebalanceExecutor,
                                                      FractalProperties properties,
                                                      EntityTableMetadataResolver entityMetadataResolver,
-                                                     ReplicaTableSynchronizer replicaTableSynchronizer) {
+                                                     ReplicaTableSynchronizer replicaTableSynchronizer,
+                                                     DataSource dataSource) {
         return args -> {
             if (properties.getRebalancer().isShardAll()) {
                 List<String> replicaTables = dependencyResolver.discoverReplicaTables(
@@ -218,7 +264,7 @@ public class FractalAutoConfiguration {
                         }
                     }
                 } catch (Exception e) {
-                    System.err.println("FRACTAL: Warning during entity metadata resolution: " + e.getMessage());
+                    log.warn("FRACTAL: Warning during entity metadata resolution: {}", e.getMessage());
                 }
             }
             replicaTableSynchronizer.syncAllReplicaTables(properties.getRebalancer().getReplicaTables());
@@ -234,32 +280,41 @@ public class FractalAutoConfiguration {
                         .filter(s -> !allYamlShards.contains(s))
                         .toList();
                 if (!unconfiguredDbShards.isEmpty()) {
-                    System.err.println("FRACTAL: Warning: Detected shards in DB topology (" + unconfiguredDbShards +
-                            ") not present in application.yml. If you intended to decommission a shard, do not delete it from YAML immediately; " +
-                            "mark it with 'decommission: true' so Fractal can safely drain data to surviving shards.");
+                    log.warn("FRACTAL: Warning: Detected shards in DB topology ({}) not present in application.yml. " +
+                            "If you intended to decommission a shard, do not delete it from YAML immediately; " +
+                            "mark it with 'decommission: true' so Fractal can safely drain data to surviving shards.",
+                            unconfiguredDbShards);
                 }
 
                 boolean drainPrimary = properties.getPrimary() != null
                         && properties.getPrimary().isDrain()
                         && !topologyManager.isPrimaryDrained();
 
+                boolean continuousDrainPrimary = properties.getPrimary() != null
+                        && properties.getPrimary().isDrain()
+                        && properties.getPrimary().isContinuousDrain()
+                        && topologyManager.isPrimaryDrained();
+
                 boolean hasNewShards = activeYamlShards.stream().anyMatch(s -> !dbShards.contains(s));
                 boolean hasDecommissioningShards = decommissionYamlShards.stream().anyMatch(dbShards::contains);
                 List<TopologyManager.PendingMigration> pendingMigrations = topologyManager.getPendingMigrations();
                 boolean hasPending = !pendingMigrations.isEmpty();
 
-                if (drainPrimary || hasNewShards || hasDecommissioningShards || hasPending) {
+                if (drainPrimary || continuousDrainPrimary || hasNewShards || hasDecommissioningShards || hasPending) {
                     if (hasPending) {
-                        System.out.println("FRACTAL: Rilevate " + pendingMigrations.size() + " migrazioni interrotte da completare in modo idempotente.");
+                        log.info("FRACTAL: Detected {} interrupted migrations to complete idempotently.", pendingMigrations.size());
                     }
                     if (drainPrimary) {
-                        System.out.println("FRACTAL: Rilevato primary.drain = true. Avvio evacuazione automatica dei dati dal database primario agli shard attivi!");
+                        log.info("FRACTAL: Detected primary.drain = true. Initiating automatic data evacuation from primary database to active shards!");
+                    }
+                    if (continuousDrainPrimary) {
+                        log.info("FRACTAL: Detected primary.continuous-drain = true. Checking continuous primary drain reconciliation across active shards...");
                     }
                     if (hasNewShards) {
-                        System.out.println("FRACTAL: Rilevata discrepanza topologia. Nuovi shard aggiunti nello YAML!");
+                        log.info("FRACTAL: Topology discrepancy detected: new shards added to configuration!");
                     }
                     if (hasDecommissioningShards) {
-                        System.out.println("FRACTAL: Rilevata decommissione shard. Avvio drenaggio automatico dei nodi in decommission!");
+                        log.info("FRACTAL: Shard decommissioning detected: initiating automatic draining of decommissioning nodes!");
                     }
 
                     fractalRebalanceExecutor.execute(() -> {
@@ -268,7 +323,7 @@ public class FractalAutoConfiguration {
                                 properties.getRebalancer().getLockRefreshInterval())) {
                             try {
                                 if (properties.getRebalancer().getRootTable() == null || properties.getRebalancer().getRootIdColumn() == null) {
-                                    System.out.println("FRACTAL: Rebalancer abilitato ma root-table o root-id-column non configurati. Registrazione topologia.");
+                                    log.info("FRACTAL: Rebalancer enabled but root-table or root-id-column not configured. Registering topology.");
                                     if (drainPrimary) {
                                         topologyManager.markPrimaryDrained();
                                     }
@@ -299,25 +354,24 @@ public class FractalAutoConfiguration {
 
                                 if (drainPrimary) {
                                     ConsistentHashRouter activeRouter = new ConsistentHashRouter(activeYamlShards, properties.getVirtualNodes());
-                                    String sql = "SELECT " + properties.getRebalancer().getRootIdColumn() + " FROM " + properties.getRebalancer().getRootTable();
-                                    JdbcTemplate primaryTemplate = new JdbcTemplate(buildDataSource(properties.getPrimary()));
-                                    List<MigrationDeltaCalculator.MigrationAction> primaryDrainActions = new ArrayList<>();
-                                    primaryTemplate.query(sql, rs -> {
-                                        String tenantId = rs.getString(1);
-                                        String targetShard = activeRouter.routeNode(tenantId);
-                                        if (targetShard != null) {
-                                            primaryDrainActions.add(new MigrationDeltaCalculator.MigrationAction(
-                                                    tenantId, TopologyManager.PRIMARY_SHARD_NAME, targetShard));
-                                        }
-                                    });
+                                    rebalanceEngine.setRouter(activeRouter);
+                                    DataSource primaryDs = resolvePrimaryDataSource(dataSource, properties);
+                                    Map<String, DataSource> shardDataSources = resolveShardDataSources(dataSource, properties);
+                                    MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(primaryDs, properties.getRebalancer());
+                                    List<MigrationDeltaCalculator.MigrationAction> primaryDrainActions = calculator.calculatePrimaryMisalignmentDelta(
+                                            activeRouter,
+                                            shardDataSources,
+                                            FractalProperties.DrainCheckMode.FULL_STREAMING,
+                                            properties.getPrimary().getDrainBatchSize()
+                                    );
 
                                     rebalanceEngine.executeMigration(primaryDrainActions);
 
                                     if (!topologyManager.hasPendingMigrationsForShard(TopologyManager.PRIMARY_SHARD_NAME)) {
                                         topologyManager.markPrimaryDrained();
-                                        System.out.println("FRACTAL: Database primario drenato con successo su tutti gli shard attivi.");
+                                        log.info("FRACTAL: Primary database drained successfully across all active shards.");
                                     } else {
-                                        System.err.println("FRACTAL: Il database primario presenta ancora migrazioni pendenti, mantenuto in stato DRAINING.");
+                                        log.warn("FRACTAL: Primary database still has pending migrations, remaining in DRAINING state.");
                                     }
 
                                     activeYamlShards.forEach(s -> {
@@ -326,9 +380,33 @@ public class FractalAutoConfiguration {
                                     });
                                 }
 
+                                if (continuousDrainPrimary) {
+                                    ConsistentHashRouter activeRouter = new ConsistentHashRouter(activeYamlShards, properties.getVirtualNodes());
+                                    rebalanceEngine.setRouter(activeRouter);
+                                    DataSource primaryDs = resolvePrimaryDataSource(dataSource, properties);
+                                    Map<String, DataSource> shardDataSources = resolveShardDataSources(dataSource, properties);
+                                    MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(primaryDs, properties.getRebalancer());
+                                    List<MigrationDeltaCalculator.MigrationAction> continuousDrainActions = calculator.calculatePrimaryMisalignmentDelta(
+                                            activeRouter,
+                                            shardDataSources,
+                                            properties.getPrimary().getDrainCheckMode(),
+                                            properties.getPrimary().getDrainBatchSize()
+                                    );
+
+                                    if (!continuousDrainActions.isEmpty()) {
+                                        log.info("FRACTAL: Continuous primary drain reconciliation detected {} unaligned tenant(s) on primary. Evacuating to shards...",
+                                                continuousDrainActions.size());
+                                        rebalanceEngine.executeMigration(continuousDrainActions);
+                                        log.info("FRACTAL: Continuous primary drain reconciliation completed successfully.");
+                                    } else {
+                                        log.info("FRACTAL: Continuous primary drain reconciliation verified: primary and shards are fully aligned.");
+                                    }
+                                }
+
                                 if (hasNewShards || hasDecommissioningShards) {
+                                    DataSource primaryDs = resolvePrimaryDataSource(dataSource, properties);
                                     MigrationDeltaCalculator calculator = new MigrationDeltaCalculator(
-                                            buildDataSource(properties.getPrimary()),
+                                            primaryDs,
                                             properties.getRebalancer()
                                     );
                                     List<MigrationDeltaCalculator.MigrationAction> actions =
@@ -343,14 +421,14 @@ public class FractalAutoConfiguration {
                                     for (String s : decommissionYamlShards) {
                                         if (!topologyManager.hasPendingMigrationsForShard(s)) {
                                             topologyManager.removeShard(s);
-                                            System.out.println("FRACTAL: Shard " + s + " drenato con successo e rimosso dalla topologia.");
+                                            log.info("FRACTAL: Shard '{}' drained successfully and removed from topology.", s);
                                         } else {
-                                            System.err.println("FRACTAL: Shard " + s + " presenta ancora migrazioni pendenti, mantenuto in stato DRAINING.");
+                                            log.warn("FRACTAL: Shard '{}' still has pending migrations, remaining in DRAINING state.", s);
                                         }
                                     }
                                 }
                             } catch (Exception e) {
-                                System.err.println("FRACTAL: Errore durante l'esecuzione del rebalancing automatico: " + e.getMessage());
+                                log.error("FRACTAL: Error executing automatic rebalancing: {}", e.getMessage(), e);
                             } finally {
                                 topologyManager.releaseRebalanceLock();
                             }
@@ -361,8 +439,32 @@ public class FractalAutoConfiguration {
         };
     }
 
-    private DataSource buildDataSource(FractalProperties.DataSourceProperties props) {
+    private DataSource resolvePrimaryDataSource(DataSource dataSource, FractalProperties properties) {
+        if (dataSource instanceof ShardingRoutingDataSource srds && srds.getPrimaryDataSource() != null) {
+            return srds.getPrimaryDataSource();
+        }
+        return buildDataSource(TopologyManager.PRIMARY_SHARD_NAME, properties.getPrimary());
+    }
+
+    private Map<String, DataSource> resolveShardDataSources(DataSource dataSource, FractalProperties properties) {
+        if (dataSource instanceof ShardingRoutingDataSource srds && srds.getShardDataSources() != null && !srds.getShardDataSources().isEmpty()) {
+            return srds.getShardDataSources();
+        }
+        Map<String, DataSource> shards = new HashMap<>();
+        if (properties.getShards() != null) {
+            properties.getShards().forEach((name, props) ->
+                    shards.put(name, buildDataSource(name, props))
+            );
+        }
+        return shards;
+    }
+
+    private DataSource buildDataSource(String name, FractalProperties.DataSourceProperties props) {
+        if (props == null || props.getJdbcUrl() == null || props.getJdbcUrl().isBlank()) {
+            throw new IllegalArgumentException("Fractal Sharding: DataSource configuration for '" + name + "' is missing or has no jdbcUrl defined!");
+        }
         HikariConfig config = new HikariConfig();
+        config.setPoolName("HikariPool-" + name);
         config.setJdbcUrl(props.getJdbcUrl());
         config.setUsername(props.getUsername());
         config.setPassword(props.getPassword());

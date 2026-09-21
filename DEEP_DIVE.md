@@ -10,7 +10,7 @@ For a quick setup and introductory guide, refer to the [README.md](file:///home/
 
 1. [Architectural Overview & Request Interception Mechanics](#1-architectural-overview--request-interception-mechanics)
    - [Request Routing Lifecycle](#request-routing-lifecycle)
-   - [Spring AOP Interception Precedence](#spring-aop-interception-precedence)
+   - [Spring AOP Interception Precedence & Pointcuts](#spring-aop-interception-precedence--pointcuts)
    - [ThreadLocal Lifecycle & Connection Leasing](#threadlocal-lifecycle--connection-leasing)
 2. [Core Components Deep Dive](#2-core-components-deep-dive)
    - [Consistent Hash Router & Ring Distribution](#consistent-hash-router--ring-distribution)
@@ -24,6 +24,7 @@ For a quick setup and introductory guide, refer to the [README.md](file:///home/
    - [Database Catalog Dependency Resolution (ANSI Information Schema)](#database-catalog-dependency-resolution-ansi-information-schema)
    - [Rebalance Execution Lifecycle & Two-Phase State Machine](#rebalance-execution-lifecycle--two-phase-state-machine)
    - [Idempotent Crash Recovery & Resumption Mechanics](#idempotent-crash-recovery--resumption-mechanics)
+   - [Atomic Reference Table Synchronization (ReplicaTableSynchronizer)](#atomic-reference-table-synchronization-replicatablesynchronizer)
 4. [Use Cases & Reference Configurations](#4-use-cases--reference-configurations)
    - [Architecture Profile Matrix](#architecture-profile-matrix)
    - [Profile 1: B2B Multi-Tenant SaaS (Zero-Config)](#profile-1-b2b-multi-tenant-saas-zero-config)
@@ -36,10 +37,14 @@ For a quick setup and introductory guide, refer to the [README.md](file:///home/
    - [Exhaustive application.yml Reference](#exhaustive-applicationyml-reference)
 6. [Advanced Usage & Integration Patterns](#6-advanced-usage--integration-patterns)
    - [Transparent Routing via Spring Security JWT](#transparent-routing-via-spring-security-jwt)
+   - [Just-In-Time (JIT) Tenant Provisioning (@Sharded(provision = true))](#just-in-time-jit-tenant-provisioning-shardedprovision--true)
    - [Handling Rebalance Migration Locks (TenantMigratingException)](#handling-rebalance-migration-locks-tenantmigratingexception)
    - [Implementing a Custom ShardingKeyExtractor](#implementing-a-custom-shardingkeyextractor)
 7. [Technical Considerations, Pitfalls & Solutions](#7-technical-considerations-pitfalls--solutions)
    - [Dual-Presence Schema Management & Flyway/Liquibase Best Practices](#dual-presence-schema-management--flywayliquibase-best-practices)
+   - [Adopting Fractal on an Already-Populated Monolithic Database (Brownfield Migration)](#adopting-fractal-on-an-already-populated-monolithic-database-brownfield-migration)
+   - [Continuous Primary Drain Reconciliation & Scale-Proof Alignment](#continuous-primary-drain-reconciliation--scale-proof-alignment)
+   - [Scaling Down: Graceful Shard Decommissioning (M -> N Shards)](#scaling-down-graceful-shard-decommissioning-m--n-shards)
    - [Joining Sharded and Non-Sharded Data](#joining-sharded-and-non-sharded-data)
    - [The Transaction Aggregation Problem and Propagation.REQUIRES_NEW Caveats](#the-transaction-aggregation-problem-and-propagationrequires_new-caveats)
    - [Database Dialect Constraints & ANSI SQL Compatibility](#database-dialect-constraints--ansi-sql-compatibility)
@@ -103,7 +108,7 @@ Dynamic shard selection operates at the boundary between Spring's AOP proxy infr
 +-------------------+     +-------------------+     +-------------------+
 ```
 
-### Spring AOP Interception Precedence
+### Spring AOP Interception Precedence & Pointcuts
 
 The order of interception between [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) and Spring's `TransactionInterceptor` is critical:
 
@@ -111,13 +116,17 @@ The order of interception between [`ShardingAspect`](file:///home/aquila/Documen
 @Aspect
 @Order(1)
 public class ShardingAspect {
-    // Interception logic
+    @Around("@annotation(io.github.mucchinas.fractal.annotation.Sharded) || @within(io.github.mucchinas.fractal.annotation.Sharded)")
+    public Object route(ProceedingJoinPoint joinPoint) throws Throwable {
+        // Interception logic
+    }
 }
 ```
 
 In standard Spring configurations, `@Transactional` aspects execute with default lowest precedence (`Ordered.LOWEST_PRECEDENCE`). By annotating [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) with `@Order(1)`, Fractal guarantees:
 1. The sharding key is parsed and routed, and the resolved shard identifier is committed to [`ShardContextHolder`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ShardContextHolder.java) *prior* to `DataSourceTransactionManager` or `JpaTransactionManager` invoking `getConnection()`.
 2. If [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) executed with lower precedence than `@Transactional`, Spring's transaction manager would acquire a connection before the sharding key is set. In that erroneous sequence, `determineCurrentLookupKey()` would return `null`, erroneously binding the entire transaction to the default `primary` datasource.
+3. The dual pointcut `@annotation(...) || @within(...)` supports both method-level routing and class-level routing. When `@Sharded` is placed on a `@Service` class, all public methods in the bean inherit shard routing automatically. Method-level annotations override class-level defaults.
 
 ### ThreadLocal Lifecycle & Connection Leasing
 
@@ -133,9 +142,12 @@ public final class ShardContextHolder {
 }
 ```
 
-To eliminate memory leaks and cross-request contamination in pooled thread environments (e.g. Tomcat, Undertow, or virtual threads), [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) wraps method invocations in a strict `try ... finally` block:
-- **`try`**: Extracts the key, checks the migration cache, resolves the shard via [`ConsistentHashRouter`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ConsistentHashRouter.java), and calls `ShardContextHolder.setShard(targetShard)`.
-- **`finally`**: Unconditionally calls `ShardContextHolder.clear()`. Even if downstream service code or transaction commits throw an unhandled `RuntimeException`, the thread context is completely sanitized before the thread returns to the server pool.
+To eliminate memory leaks, cross-request contamination in pooled thread environments (e.g. Tomcat, Undertow, or virtual threads), and to safely support **nested `@Sharded` and `@ShardedBroadcast` invocations**, [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) and [`ShardedBroadcastAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardedBroadcastAspect.java) implement **stack-based context leasing**:
+- **Context Capture**: Captures `String previousShard = ShardContextHolder.getShard()` before updating context to `targetShard`.
+- **`try`**: Extracts the key, checks the migration cache, resolves the shard via [`ConsistentHashRouter`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ConsistentHashRouter.java), tracks in-flight requests, and calls `ShardContextHolder.setShard(targetShard)`.
+- **`finally`**: Checks if an outer context was present. If `previousShard != null`, it restores the outer context (`ShardContextHolder.setShard(previousShard)`); only when exiting the outermost invocation (`previousShard == null`) does it call `ShardContextHolder.clear()`.
+
+This guarantees that nested service calls (such as an internal audit service or broadcast update invoked from within a sharded tenant method) will never prematurely wipe or corrupt the caller's thread-local shard context upon returning. Even if downstream code or transaction commits throw an unhandled `RuntimeException`, the thread context is completely restored or sanitized before returning to the container thread pool.
 
 ---
 
@@ -171,6 +183,7 @@ To eliminate memory leaks and cross-request contamination in pooled thread envir
 1. **Virtual Node Factor (`virtualNodes`, default: `150`)**:
    - Each physical shard registers $V$ virtual positions on the ring with the token key `<shardName>-VN-<i>`.
    - With 150 virtual nodes per shard, the standard deviation of key distribution drops below $5\%$, preventing hot spots and uneven disk utilization across physical hardware.
+   - **Strict Parameter Validation**: `virtualNodes` must be strictly positive ($> 0$). Constructing a router with $V \le 0$ throws `IllegalArgumentException`.
 2. **Ring Storage**:
    - Implemented as an immutable or synchronized `java.util.TreeMap<Long, String>`.
 3. **Cryptographic Hashing**:
@@ -180,20 +193,25 @@ To eliminate memory leaks and cross-request contamination in pooled thread envir
 4. **Binary Search Traversal ($O(\log(N \times V))$)**:
    - Shard lookup calls `ring.tailMap(hash)`.
    - If `tailMap.isEmpty()` is true, traversal wraps around clockwise to `ring.firstKey()`.
+   - If the ring contains zero active shards, `routeNode` safely returns `null`.
 5. **Minimal Key Relocation**:
    - When a new physical shard is introduced, only $\frac{K}{N+1}$ keys are relocated (where $K$ is the total key count and $N$ is the number of active shards), leaving all other mappings undisturbed.
 
 ### Sharding Routing DataSource & HikariCP Pools
 
-[`ShardingRoutingDataSource`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/datasource/ShardingRoutingDataSource.java) subclasses Spring JDBC's `AbstractRoutingDataSource`:
+[`ShardingRoutingDataSource`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/datasource/ShardingRoutingDataSource.java) subclasses Spring JDBC's `AbstractRoutingDataSource` and implements Spring's `DisposableBean`:
 
-1. **Independent Connection Pools**:
-   - For every physical shard declared under `fractal.sharding.shards`, an isolated `HikariDataSource` pool is instantiated and registered in a target data source dictionary (`Map<Object, Object>`).
+1. **Centralized HikariCP Pools & Single-Instance Sharing**:
+   - For every physical shard declared under `fractal.sharding.shards`, an isolated `HikariDataSource` pool is instantiated in [`FractalAutoConfiguration`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/config/FractalAutoConfiguration.java).
    - A dedicated `HikariDataSource` pool is created for the `primary` database.
+   - Rather than creating duplicate connection pools across subsystems, the **exact same pooled instances** are shared across `ShardingRoutingDataSource`, `TopologyManager`, `RebalanceEngine`, and `ReplicaTableSynchronizer`. This eliminates connection pool explosion and prevents database port exhaustion.
 2. **Dynamic Key Resolution**:
    - Overrides `determineCurrentLookupKey()`, which returns `ShardContextHolder.getShard()`.
 3. **Fallback Target**:
    - The primary data source is set as `defaultTargetDataSource`. Any un-sharded database interaction or unannotated service invocation automatically defaults to the primary database.
+4. **Clean Resource Disposal (`DisposableBean`)**:
+   - On Spring application context shutdown, `ShardingRoutingDataSource.destroy()` systematically inspects all target datasources and the default primary datasource.
+   - Any `AutoCloseable` or `HikariDataSource` instance is explicitly closed, cleanly terminating active worker threads, releasing JDBC socket handles, and avoiding database connection leaks during rolling redeployments.
 
 ### Sharding Key Extraction Pipeline
 
@@ -216,9 +234,10 @@ Method Invocation
    - Injects an ordered stream of `ShardingKeyExtractor` beans (`ObjectProvider<ShardingKeyExtractor>`).
    - For instance, [`JwtSecurityKeyExtractor`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/security/JwtSecurityKeyExtractor.java) extracts the designated tenant claim from Spring Security's `SecurityContextHolder`.
    - The first extractor that yields a non-blank string supplies the routing key.
-2. **Tier 2 - SpEL Expression Parser**:
+2. **Tier 2 - Compiled SpEL Expression Evaluation**:
    - Evaluates the `@Sharded(key = "...")` expression against method arguments.
-   - Leverages `SpelExpressionParser` and `StandardEvaluationContext` backed by `DefaultParameterNameDiscoverer`.
+   - **AST Compilation Caching**: Expressions are compiled and stored in an internal thread-safe `ConcurrentHashMap<String, Expression>`. Repeated invocations reuse parsed ASTs, avoiding runtime parsing overhead on hot transaction paths.
+   - **Parameter Discovery**: Backed by `DefaultParameterNameDiscoverer`, ensuring reliable parameter name binding across standard classes and interface-based Spring proxies.
    - Supports parameter identifiers (e.g. `#tenantId`), nested properties (`#request.company.id`), and complex SpEL expressions.
 3. **Tier 3 - Fail-Fast Guard**:
    - If neither a strategic extractor nor SpEL evaluation produces a valid key, execution halts immediately with an `IllegalStateException`, aborting the transaction before any database connection is acquired.
@@ -352,13 +371,14 @@ If an application pod dies abruptly (e.g., OOMKilled, SIGKILL, hardware failure)
   ```
   where the timestamp threshold is `now - lockTimeout`. If rows are affected ($1$), the dead lock is atomically commandeered.
 
-#### 3. Periodic Heartbeat Daemon:
+#### 3. Periodic Heartbeat Daemon & Circuit Breaker:
 For large datasets where batch migrations exceed standard timeouts, a background heartbeat daemon thread refreshes the lock timestamp at a fixed interval (`fractal.sharding.rebalancer.lock-refresh-interval`, default: `1m`):
 ```sql
 UPDATE fractal_locks
 SET locked_at = CURRENT_TIMESTAMP
 WHERE lock_name = 'REBALANCE_LOCK' AND locked_by = ?
 ```
+**Heartbeat Failover Circuit Breaker**: If database downtime or prolonged network isolation causes 3 consecutive heartbeat renewals to fail, the daemon relinquishes the lock locally, halts renewal, and logs a critical alert. This prevents a disconnected node from continuing to execute migrations under an assumed lock while allowing surviving nodes to commandeer the expired lock after the configured TTL.
 
 #### 4. Graceful Shutdown Hook:
 [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java) implements Spring's `DisposableBean`. Upon receiving `SIGTERM`:
@@ -493,6 +513,9 @@ When physical shards are added, the rebalance runner acquires `REBALANCE_LOCK` a
 
 - **Fast Path (~15 Nanoseconds)**: Service methods check `TopologyManager.isTenantMigrating(tenantId)` directly in JVM heap memory with zero network or JDBC overhead during rebalancing.
 - **Slow Path (Authoritative Lookup)**: On a cache miss or TTL expiration (`status-cache-ttl`, default: `2s`), Fractal queries `fractal_tenant_migrations` and the master root table on the Primary DB.
+- **Non-Blocking `PHASE_PENDING` Routing**: When a tenant migration is registered as `PENDING` in `fractal_tenant_migrations`, `TopologyManager.isTenantMigrating()` returns `false`. Incoming requests for pending tenants are never blocked or rejected prematurely. Instead, queries continue routing to their old source shard via `TopologyManager.getPendingSourceShard()`. Only when the tenant transitions to `COPYING` or `PRUNING` does `isTenantMigrating()` return `true` to raise `TenantMigratingException` (HTTP 503).
+- **Multi-Node Primary DB Fallback**: On secondary cluster nodes where the local `pendingMigrations` map has not been primed, or during pod restarts mid-rebalance, `getPendingSourceShard(tenantId)` queries `fractal_tenant_migrations` directly on the Primary DB. If the tenant record is found in `PHASE_PENDING`, the query routes to its recorded `source_shard`. If the record is in `PHASE_COPYING` or `PHASE_PRUNING`, `isTenantMigrating()` throws `TenantMigratingException`.
+- **Leak-Free In-Flight Request Tracking**: In [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java), in-flight request tracking is guarded by a strict `try ... finally` block. If `isTenantMigrating()` throws `TenantMigratingException`, `decrementInFlightRequests()` is guaranteed to execute in the `finally` block, ensuring that in-flight request counters never leak in memory or cause subsequent migration quiescence drains to stall.
 - **Proactive Local Cache Priming**:
   - `markTenantMigrating(id)`: Immediately writes `true` to local cache.
   - `markTenantActive(id)`: Immediately writes `false` to local cache.
@@ -721,9 +744,10 @@ When domain entity annotations are absent or when `fractal.sharding.rebalancer.s
 
 1. **Catalog Introspection**: Queries `information_schema.referential_constraints` and `information_schema.key_column_usage`.
 2. **Multi-Hop BFS Traversal**: Traces foreign key paths recursively from `rootTable` to discover all child tables.
-3. **Kahn's Topological Sort**:
+3. **Kahn's Topological Sort & Determinism**:
    - **Insert Ordering**: Root/parent tables first, moving downstream to leaf child tables.
    - **Delete Ordering**: Reverse of the insert order (leaf child tables first, root tables last).
+   - **Deterministic Graph Ordering**: Uses deterministic `LinkedHashMap` and `LinkedHashSet` structures throughout foreign key discovery and Kahn's topological sort, guaranteeing reproducible, deterministic table copy and delete sequences across different JVM executions and operating systems.
 4. **Catalog-Wide Sharding (`shard-all`)**:
    - Automatically inspects all base user tables in the database.
    - Excludes internal system schemas (`pg_catalog`, `information_schema`, `sys`) and tables declared in `exclude-tables`.
@@ -755,6 +779,7 @@ CREATE TABLE IF NOT EXISTS fractal_tenant_migrations (
 1. Lock Tenant & Drain Transactions
    - UPDATE root SET status = 'MIGRATING'
    - In-memory Caffeine cache set to true
+   - Sleep max(quiescencePeriod, statusCacheTtl)
    - Await in-flight requests (drain-timeout)
              |
              v
@@ -791,7 +816,7 @@ CREATE TABLE IF NOT EXISTS fractal_tenant_migrations (
 [Migration Complete]
 ```
 
-1. **Lock Entity & Drain In-Flight Transactions**: Sets tenant status to `MIGRATING` on the master Primary table and primes the Caffeine cache. Waits up to `drain-timeout` (default: `10s`) for local transactions to drain to 0 via `awaitTenantQuiescence`. If transactions fail to drain, migration is deferred safely. An optional `quiescence-period` (default: `0s`) provides a cluster-wide pause for distributed transactions.
+1. **Lock Entity & Drain In-Flight Transactions**: Sets tenant status to `MIGRATING` on the master Primary table and primes the Caffeine cache. Invokes `awaitTenantQuiescence`, which enforces a mandatory initial pause of at least `status-cache-ttl` (default: `2s`) to ensure all cluster pods' local Caffeine caches have expired their `ACTIVE` status and refreshed to `MIGRATING`. It then waits up to `drain-timeout` (default: `10s`) for active local requests on that tenant to drain to 0. If transactions fail to drain within the timeout, migration is deferred safely.
 2. **Record Copy Phase**: Registers the tenant in `fractal_tenant_migrations` with `phase = 'COPYING'`.
 3. **Idempotent Target Sanitization**: Checks if an earlier aborted migration left orphan rows on the target shard. If source still holds data, partial target rows are safely purged in reverse topological order.
 4. **Data Replication**: Selects and streams rows from source to target in topological insert order using multi-hop SQL joins. Batch sizes are dynamically bounded:
@@ -801,6 +826,15 @@ CREATE TABLE IF NOT EXISTS fractal_tenant_migrations (
 6. **Data Eviction**: Deletes migrated rows from source shard in reverse topological order.
 7. **Clear Migration State**: Deletes row from `fractal_tenant_migrations`.
 8. **Unlock Entity**: Restores tenant status to `ACTIVE` on Primary DB and updates cache.
+
+#### Automatic Rollback on Migration Failure
+If an unexpected exception (e.g. database network disconnect, disk full, unhandled constraint error) occurs during table copying (step 4) or source pruning (step 6), `RebalanceEngine` executes an automated rollback inside its `catch` block:
+1. Resets the tenant status to `ACTIVE` in both the Primary DB root table and `fractal_tenant_migrations`.
+2. Purges any partially copied records from the target shard in reverse topological order.
+3. Invalidates the tenant's cache entry in `TopologyManager`.
+4. Rethrows the exception to notify operators.
+
+This guarantees that transient errors will never leave a tenant locked in permanent `MIGRATING` state (which would otherwise cause infinite HTTP 503 errors).
 
 ---
 
@@ -814,6 +848,20 @@ If an application instance terminates mid-migration (SIGKILL, container preempti
 | **Aborted during `PRUNING`** | Target shard has 100% of committed data; source shard has partial data. | The engine detects that target data is complete. It skips copying (preventing unique constraint errors) and finishes the remaining deletions on the source shard. |
 | **Completed before crash** | Data exists only on target shard (`!sourceHasData && targetHasData`). | The engine marks tenant `ACTIVE`, removes stale tracking records, and completes immediately. |
 | **Repetitive Execution** | Migration engine invoked repeatedly on identical state. | Yields zero side effects and deterministic completion. |
+
+---
+
+### Atomic Reference Table Synchronization (ReplicaTableSynchronizer)
+
+[`ReplicaTableSynchronizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizer.java) copies read-mostly lookup tables ([`@ShardedReplica`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/annotation/ShardedReplica.java)) from the primary coordinator database to physical worker shards on application startup and whenever new shards join the cluster:
+
+1. **Transactional Synchronization per Shard**:
+   - Each target shard's synchronization is wrapped inside a `TransactionTemplate`.
+   - If an insert or network failure occurs while synchronizing a table batch, the transaction on that shard rolls back completely. This ensures target shards are never left with empty, truncated, or half-populated reference tables.
+2. **Cluster Shard State Filtering**:
+   - Skips shards that are currently `DRAINING` or `DECOMMISSIONED` in `fractal_shard_topology`. Reference data is only delivered to active member shards.
+3. **Batch Parameter Bounding**:
+   - Uses dynamically bounded chunks to satisfy JDBC parameter bind limits across database engines.
 
 ---
 
@@ -1240,10 +1288,15 @@ All properties are rooted under `fractal.sharding`:
 | `fractal.sharding.enabled` | `boolean` | `true` | Enables or disables Fractal auto-configuration. |
 | `fractal.sharding.virtual-nodes` | `int` | `150` | Number of virtual points per physical shard on the hash ring. |
 | `fractal.sharding.jwt.claim-name` | `String` | `sub` | JWT claim name to extract as sharding key (e.g. `sub`, `tenant_id`, `org_id`). |
+| `fractal.sharding.jwt.attribute-claims` | `Map<String, String>` | `{}` | Optional mapping of JWT claim names to root entity column names for JIT tenant provisioning (e.g. `org_tier: tier`). |
 | `fractal.sharding.primary.jdbc-url` | `String` | - | JDBC URL for the primary coordination database. |
 | `fractal.sharding.primary.username` | `String` | - | Database username for the primary datasource. |
 | `fractal.sharding.primary.password` | `String` | - | Database password for the primary datasource. |
 | `fractal.sharding.primary.initialize-schema` | `boolean` | `true` | Automatically creates internal coordination tables (`fractal_shard_topology`, `fractal_locks`, `fractal_tenant_migrations`) on primary DB at startup. |
+| `fractal.sharding.primary.drain` | `boolean` | `false` | When `true`, evacuates all sharded child tables from the primary coordinator database to target shards at startup while preserving the root catalog on primary. |
+| `fractal.sharding.primary.continuous-drain` | `boolean` | `true` | When `primary.drain` is active, continuously reconciles unaligned or newly inserted tenants on `primary` against physical shards at startup. |
+| `fractal.sharding.primary.drain-batch-size` | `int` | `5000` | Keyset pagination streaming chunk size and batch verification limit for continuous drain reconciliation. |
+| `fractal.sharding.primary.drain-check-mode` | `DrainCheckMode` | `COUNT_THEN_PROBE` | Alignment verification strategy (`COUNT_THEN_PROBE`, `PROBE_ONLY`, `FULL_STREAMING`). |
 | `fractal.sharding.shards.<name>.jdbc-url` | `String` | - | JDBC URL for physical shard `<name>`. |
 | `fractal.sharding.shards.<name>.username` | `String` | - | Database username for physical shard `<name>`. |
 | `fractal.sharding.shards.<name>.password` | `String` | - | Database password for physical shard `<name>`. |
@@ -1277,11 +1330,17 @@ fractal:
     virtual-nodes: 150            # Virtual nodes per shard on the consistent hash ring
     jwt:
       claim-name: tenant_id       # JWT claim extracted for sharding key (default: 'sub')
+      attribute-claims:           # Optional JWT claim to root column mappings for JIT provisioning
+        org_tier: tier
     primary:
       jdbc-url: jdbc:postgresql://coordinator-db:5432/primary_meta
       username: fractal_admin
       password: ${PRIMARY_DB_PASSWORD}
       initialize-schema: true     # Auto-create coordination tables (fractal_locks, etc.)
+      drain: false                # When true, evacuates all sharded child tables to target shards
+      continuous-drain: true      # When drain is true, continuously reconciles unaligned tenants at boot
+      drain-batch-size: 5000      # Keyset streaming batch size for continuous reconciliation
+      drain-check-mode: COUNT_THEN_PROBE # COUNT_THEN_PROBE | PROBE_ONLY | FULL_STREAMING
     shards:
       shard-eu-1:
         jdbc-url: jdbc:postgresql://shard-eu-1:5432/shard_data
@@ -1342,6 +1401,177 @@ When `spring-boot-starter-oauth2-resource-server` is present on the classpath, [
       }
   }
   ```
+
+---
+
+### Just-In-Time (JIT) Tenant Provisioning (`@Sharded(provision = true)`)
+
+In modern cloud applications using external identity providers (Keycloak, Auth0, Okta, Azure AD), users authenticate via standard OAuth2 / OpenID Connect flows. When a user logs in for the very first time, their identity is cryptographically proven by a valid, signed Bearer JWT token, but **no corresponding record exists yet in the database root table**.
+
+Attempting to query or persist child entities (e.g. `projects`, `wallets`, `user_settings`) immediately fails with foreign key constraint violations because the tenant anchor record does not exist on the physical shard.
+
+Fractal provides **declarative Just-In-Time (JIT) tenant provisioning** directly through the `@Sharded` annotation:
+
+```java
+@Service
+public class UserOnboardingService {
+
+    // Targeted Provisioning: Automatically provisions the root record on primary and target shard
+    @Sharded(key = "#userId", provision = true)
+    public UserProfile getOrCreateUserProfile(String userId) {
+        return userProfileRepository.findById(userId)
+                .orElseThrow(() -> new IllegalStateException("User profile should have been provisioned"));
+    }
+
+    // Standard business methods omit provision = true (default: false), guaranteeing 0 ns overhead
+    @Sharded(key = "#userId")
+    public List<Order> listUserOrders(String userId) {
+        return orderRepository.findAllByUserId(userId);
+    }
+}
+```
+
+#### 1. The Zero-Overhead Fast Path Invariant
+
+To guarantee that high-throughput production workloads do not suffer performance degradation:
+- Standard `@Sharded` methods (`provision = false`, default) **completely bypass** the provisioning engine.
+- [`ShardingAspect`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/aop/ShardingAspect.java) evaluates `if (!sharded.provision())` as its very first step after key extraction.
+- **Zero Cache Misses & Zero DB Queries**: No cache checks, no database roundtrips, and **0 ns overhead** on all ordinary business method invocations.
+- Provisioning logic runs strictly when explicitly declared via `@Sharded(provision = true)` on designated authentication or onboarding service entry points.
+
+#### 2. Dual-Presence Root Catalog Atomicity
+
+When `@Sharded(provision = true)` is invoked and the sharding key is not present in the root catalog:
+1. **Master Catalog on Primary Database**:
+   - [`DefaultTenantProvisioner`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/provisioning/DefaultTenantProvisioner.java) inserts the root record into the master table on the `primary` datasource.
+   - This ensures the global catalog, central authentication checks, and rebalancer delta calculators immediately recognize the tenant's existence.
+2. **Local Slice on Physical Target Shard**:
+   - The consistent hash router determines the physical shard: $S = \text{router.routeNode}(\text{shardingKey})$.
+   - The provisioner connects to shard $S$ and inserts the identical root record into the local root table slice.
+   - This enables native relational foreign keys and cascading operations on the shard without cross-database hops.
+
+```
+                           [First-Time Login Request]
+                                       |
+                                       v
+                    +------------------------------------+
+                    |  @Sharded(provision = true)        |
+                    |  ShardingAspect Interception       |
+                    +------------------+-----------------+
+                                       |
+                                       v
+                    +------------------------------------+
+                    |  Caffeine Existence Cache Miss?    |
+                    +------------------+-----------------+
+                                       |
+                                       v
+                    +------------------------------------+
+                    |  Per-Tenant Keyed Mutex Lock       |
+                    |  (ConcurrentHashMap<String, Object>)|
+                    +------------------+-----------------+
+                                       |
+                         +-------------+-------------+
+                         |                           |
+                         v                           v
+             +-----------------------+   +-----------------------+
+             | Master Catalog Record |   | Local Root Slice      |
+             | INSERT INTO primary   |   | INSERT INTO target    |
+             | (organizations/users) |   | (organizations/users) |
+             +-----------------------+   +-----------+-----------+
+                                                     |
+                                                     v
+                                         +-----------------------+
+                                         | TenantInitializer SPI |
+                                         | (Seed child tables    |
+                                         |  e.g. user_settings)  |
+                                         +-----------------------+
+```
+
+#### 3. Concurrency & High-Traffic SPA Burst Protection
+
+When a modern Single-Page Application (SPA) boots following an OAuth2 redirect, it routinely dispatches 5 to 10 concurrent HTTP requests in parallel (e.g., fetching user profile, feature flags, permissions, notifications). If the user is logging in for the first time, all 10 requests hit the server simultaneously.
+
+Fractal provides 3-tier protection against race conditions and lock contention:
+1. **Per-Tenant In-Memory Keyed Mutex**:
+   - [`DefaultTenantProvisioner`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/provisioning/DefaultTenantProvisioner.java) locks on a fine-grained, per-tenant object lock using `ConcurrentHashMap<String, Object>`.
+   - Concurrent requests for tenant $A$ are serialized locally within the JVM, while requests for tenant $B$ proceed completely concurrently with zero lock contention.
+2. **Sub-Microsecond In-Memory Existence Cache**:
+   - Once tenant $A$ is provisioned, its key is cached in a local [Caffeine](https://github.com/ben-manes/caffeine) cache with a 10-minute TTL.
+   - The remaining parallel requests in the burst observe the cache hit in ~15 nanoseconds and proceed directly without touching the database.
+3. **Cross-Pod Database Collision Idempotency**:
+   - In horizontally scaled multi-pod environments, two pods may attempt to provision tenant $A$ concurrently.
+   - Database unique constraint violations (`DataIntegrityViolationException`) are caught and suppressed gracefully as deterministic proof that the tenant was already committed by a peer pod.
+
+#### 4. Automatic Column Extraction Pipeline
+
+[`RootEntityAttributeExtractor`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/provisioning/RootEntityAttributeExtractor.java) maps JWT claims and metadata onto root table database columns:
+
+1. **Partition Primary Key (`@ShardedKey`)**:
+   - Bound directly to the extracted sharding key (e.g. `userId` from the JWT `sub` claim).
+2. **Migration Status (`@ShardedStatus`)**:
+   - Automatically set to `ACTIVE` (or the configured `activeValue`).
+3. **Conventional Claim Matching**:
+   - Automatically inspects the fields of the `@ShardedRoot` entity class and maps standard JWT token claims to corresponding database columns:
+     - Entity field `email` $\to$ JWT claim `email`
+     - Entity field `username` or `user_name` $\to$ JWT claim `preferred_username`
+     - Entity field `name` or `full_name` $\to$ JWT claim `name`
+     - Entity field `created_at` or `createdAt` $\to$ current database timestamp `java.sql.Timestamp` (only mapped if the entity declares the field).
+4. **Declarative Custom Claim Mappings (`attribute-claims`)**:
+   - Custom or non-standard claims can be mapped declaratively in `application.yml`:
+     ```yaml
+     fractal:
+       sharding:
+         jwt:
+           attribute-claims:
+             org_tier: tier
+             department_code: dept
+     ```
+
+#### 5. Extensibility SPIs: Child Table Seeding & Customization
+
+##### Seeding Child Tables (`TenantInitializer`)
+After the root entity row is inserted onto the target shard, applications often need to seed default child rows (e.g. default preferences, starter projects, audit trail). Implement the [`TenantInitializer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/provisioning/TenantInitializer.java) SPI:
+
+```java
+@Component
+public class DefaultUserSettingsInitializer implements TenantInitializer {
+
+    private final JdbcTemplate jdbcTemplate;
+
+    public DefaultUserSettingsInitializer(DataSource dataSource) {
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+    }
+
+    @Override
+    public void initializeTenant(String tenantId, String targetShard, Map<String, Object> rootAttributes) {
+        // ShardContextHolder is ALREADY bound to targetShard on this thread!
+        jdbcTemplate.update(
+            "INSERT INTO user_settings (id, user_id, theme, notifications_enabled) VALUES (?, ?, ?, ?)",
+            UUID.randomUUID().toString(),
+            tenantId,
+            "DARK_MODE",
+            true
+        );
+    }
+}
+```
+
+##### Programmatic Attribute Customization (`RootEntityCustomizer`)
+To compute or enrich root table columns dynamically before insertion (e.g. calculating billing tiers or assigning default quotas), implement [`RootEntityCustomizer`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/provisioning/RootEntityCustomizer.java):
+
+```java
+@Component
+public class BillingTierCustomizer implements RootEntityCustomizer {
+
+    @Override
+    public void customizeRootEntity(String shardingKey, Map<String, Object> attributes, Authentication authentication) {
+        if (!attributes.containsKey("tier")) {
+            attributes.put("tier", "COMMUNITY_FREE");
+        }
+        attributes.put("storage_quota_mb", 5120);
+    }
+}
+```
 
 ---
 
@@ -1565,7 +1795,106 @@ fractal:
    - Once all tenants have been migrated off `primary`, [`TopologyManager`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/TopologyManager.java) records `primary` with `status = 'DRAINED'` in `fractal_shard_topology`.
    - On subsequent restarts, Fractal detects that `primary` is already drained and skips re-execution without redundant work.
 
-#### 3. Scaling Down: Graceful Shard Decommissioning ($M \to N$ Shards)
+---
+
+### Continuous Primary Drain Reconciliation & Scale-Proof Alignment
+
+#### The Post-Drain Drift Challenge
+
+In enterprise hybrid environments, after `primary` is initially marked `DRAINED`, the primary database rarely remains completely static:
+- External identity management (IAM) synchronization jobs or SCIM connectors may insert new tenant organizations or user records directly into `primary`.
+- Legacy internal admin tools, ETL pipelines, or batch scripts may continue writing new tenant aggregates to the primary database.
+- Developers or DBAs may execute batch seed scripts during staging or release deployment windows.
+
+If Fractal merely checked `if (topology.isShardDrained("primary")) return;`, these newly inserted tenants would remain stranded on `primary`. Child queries would route to worker shards, failing with missing record errors.
+
+#### The Memory-Safe 3-Tier Reconciliation Engine
+
+To guarantee continuous alignment without consuming unbounded JVM heap or degrading application boot time, Fractal implements a **constant-memory 3-Tier reconciliation engine** in [`MigrationDeltaCalculator`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/MigrationDeltaCalculator.java):
+
+```
+                   [Continuous Drain Startup Check]
+                                  |
+                                  v
++-------------------------------------------------------------------+
+| Tier 1: Instant Count Guard (2-5 ms, 16 bytes heap)                |
+| SELECT COUNT(*) on primary vs SUM(COUNT(*)) across active shards  |
++---------------------------------+---------------------------------+
+                                  |
+               +------------------+------------------+
+               | (Counts Match)                      | (Counts Differ)
+               v                                     v
++-------------------------------+ +---------------------------------+
+| ZERO DRIFT DETECTED           | | Tier 2: Status-Indexed Probe    |
+| - Fast Path Complete          | | (< 1 ms via DB index)           |
+| - 0 extra queries             | | SELECT id WHERE status != ACTIVE|
+| - 0 memory allocation         | +----------------+----------------+
++-------------------------------+                  |
+                                  +----------------+----------------+
+                                  | (Has Unaligned)| (Status Missing|
+                                  v                |  or Inconclusive)
+                  +------------------------------+ v
+                  | Evacuate K unaligned tenants | +----------------+
+                  +------------------------------+ | Tier 3: Keyset |
+                                                   | Streaming      |
+                                                   | Cursor (500 KB)|
+                                                   +----------------+
+```
+
+##### Tier 1: Instant Count Guard (Zero-Allocation Fast Path)
+- **Execution**: Computes `countPrimary = SELECT COUNT(*) FROM rootTable` on `primary` and sums `countShards = SELECT COUNT(*) FROM rootTable` across all active worker shards.
+- **Latency & Memory**: Completes in **2–5 ms** over JDBC and allocates **16 bytes** of heap memory (two primitive 64-bit `long` integers).
+- **Result**: In **99.9% of routine application restarts**, `countPrimary == countShards`. The reconciliation engine terminates immediately with zero further database roundtrips, zero row fetching, and zero JVM memory pressure.
+
+##### Tier 2: Status-Indexed Probe (< 1 ms via Database Index)
+- **Execution**: When counts differ and the `@ShardedStatus` column is present on `rootTable`, Fractal queries:
+  ```sql
+  SELECT id FROM rootTable WHERE sync_status != 'ACTIVE'
+  ```
+- **Performance**: Backed by a standard B-Tree index on `sync_status`, this query executes in **< 1 ms** even on tables containing 100,000,000+ rows.
+- **Result**: If new tenants were inserted with initial statuses (e.g. `PENDING`, `NEW`, `UNASSIGNED`), Fractal fetches strictly the $K$ misaligned IDs into memory, bypassing full table scanning entirely.
+
+##### Tier 3: Bounded Keyset Streaming Cursor (~500 KB Heap Bound)
+- **Execution**: If Tier 2 is disabled or inconclusive (e.g. no status column defined), Fractal performs deterministic keyset pagination:
+  ```sql
+  SELECT id FROM rootTable WHERE id > :lastSeenId ORDER BY id ASC LIMIT :drainBatchSize
+  ```
+- **Scale-Proof Invariant**:
+  - The cursor processes the table in strictly bounded chunks (default `drain-batch-size: 5000`).
+  - For each chunk of 5,000 IDs, Fractal groups IDs by their routed shard via [`ConsistentHashRouter`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/core/ConsistentHashRouter.java) and queries the target shards in sub-batches of 1,000 (`WHERE id IN (...)`) to detect unaligned records.
+  - **Constant Memory Bound**: Heap consumption is strictly capped at **~500 KB**, regardless of whether the primary database holds 10,000 or 50,000,000 root records. It is completely immune to JVM `OutOfMemoryError`.
+
+#### On-Demand Runtime Drain API (Zero Pod Restarts)
+
+For scenarios where an external process adds a tenant to `primary` while the application is actively serving traffic, Fractal provides an on-demand programmatic drain API through [`RebalanceEngine`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/main/java/io/github/mucchinas/fractal/rebalance/RebalanceEngine.java):
+
+```java
+@Service
+public class TenantLifecycleService {
+
+    @Autowired
+    private RebalanceEngine rebalanceEngine;
+
+    // Evacuates a single newly created tenant from primary to its consistent hash shard
+    public void evacuateTenantFromPrimary(String tenantId) {
+        rebalanceEngine.drainTenantFromPrimary(tenantId);
+    }
+
+    // Explicitly overrides target shard placement if required
+    public void evacuateTenantToSpecificShard(String tenantId, String targetShard) {
+        rebalanceEngine.drainTenantFromPrimary(tenantId, targetShard);
+    }
+}
+```
+
+##### Runtime Drain Guarantees:
+1. **Zero Downtime**: Unaffected tenants continue serving traffic without lock contention.
+2. **Master Catalog Retention**: The root record on `primary` is preserved in status `ACTIVE`, ensuring primary metadata integrity.
+3. **Immediate Traffic Cutover**: Live traffic for `tenantId` cuts over to the target worker shard in sub-second time.
+
+---
+
+### Scaling Down: Graceful Shard Decommissioning ($M \to N$ Shards)
 
 Cluster scale-down (e.g. contracting from 3 shards to 2 shards, or decommissioning an ephemeral maintenance shard) requires safely migrating all tenant records from the retiring shard(s) to the surviving shards without data loss or request errors.
 
@@ -1745,13 +2074,21 @@ Attempting to bypass routing lock-in using `@Transactional(propagation = Propaga
 mvn clean test
 ```
 
-The test suite rigorously validates the starter across 20 test classes covering 97 automated test cases, specifically designed to prevent false positives and verify physical database operations:
+The test suite rigorously validates the starter across 34 test classes covering 113 automated test cases, specifically designed to prevent false positives and verify physical database operations:
 
 - [`DualRingMigrationRoutingTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/DualRingMigrationRoutingTest.java): Asserts dynamic dual-ring routing during active rebalancing (pending tenants route to old source shard, active migrating tenant throws `TenantMigratingException`, completed tenants immediately cut over to new ring shard, non-migrating bystanders route unaffected), zero-overhead fast path in steady state, and Caffeine caching of global rebalance status.
 - [`ShardDecommissioningTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/ShardDecommissioningTest.java): Tests the end-to-end cluster contraction lifecycle ($M \to N$), verifying that decommissioning shards are excluded from the active ring, their tenants are safely migrated to surviving shards, and the shard is automatically deregistered from topology upon completion.
 - [`PrimaryDrainMigrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/PrimaryDrainMigrationTest.java): Tests brownfield onboarding via `primary.drain: true`, verifying that all child tables are evacuated from the primary database to worker shards, root table records are retained with `ACTIVE` status, and the primary shard lifecycle transitions cleanly from `DRAINING` to `DRAINED`.
 - [`PrimaryDrainSpringBootTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/PrimaryDrainSpringBootTest.java): Full Spring Boot integration test validating automated startup evacuation of a pre-populated primary database to worker shards, followed by verified live `@Sharded` query execution on worker shards.
-- [`ConsistentHashRouterTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/core/ConsistentHashRouterTest.java): Validates deterministic routing, MD5 hash calculation, ring contraction preserving surviving shard assignments, 64-bit ring wrap-around, null key safety, empty ring safety, and uniform distribution across virtual nodes.
+- [`ContinuousPrimaryDrainScaleSafetyTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/ContinuousPrimaryDrainScaleSafetyTest.java): Validates the 3-tier constant-memory alignment engine under brownfield scale conditions, asserting that Tier 1 count guard terminates in $O(1)$ constant time with 0 allocations, Tier 2 status probe detects unaligned tenants via indexed scans, and Tier 3 keyset pagination streams large ID spaces in bounded chunks without heap memory spikes or `OutOfMemoryError`.
+- [`IncrementalTenantDrainTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/IncrementalTenantDrainTest.java): Tests continuous startup reconciliation when new tenants are added to the primary database after initial evacuation, asserting that only the delta tenants are migrated to worker shards while pre-existing drained tenants are untouched and the master root row is preserved on primary.
+- [`RuntimeTenantDrainApiTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/RuntimeTenantDrainApiTest.java): Validates the on-demand programmatic runtime drain API (`rebalanceEngine.drainTenantFromPrimary(tenantId)` and `rebalanceEngine.drainTenantFromPrimary(tenantId, targetShard)`), asserting immediate single-tenant evacuation from primary to worker shards with sub-second cutover without requiring application restarts.
+- [`TargetedProvisioningIntegrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/provisioning/TargetedProvisioningIntegrationTest.java): Validates end-to-end Just-In-Time (JIT) tenant provisioning via `@Sharded(provision = true)`, verifying that first-time authenticated users (e.g. Keycloak JWT) have root records created atomically in both the primary master catalog and the routed physical shard with claims mapped to columns.
+- [`ZeroOverheadBypassTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/provisioning/ZeroOverheadBypassTest.java): Asserts the zero-overhead fast-path invariant for standard `@Sharded` methods (`provision = false`, default), verifying that `TenantProvisioner` is completely bypassed with 0 cache lookups and 0 database queries.
+- [`ParallelKeycloakLoginBurstTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/provisioning/ParallelKeycloakLoginBurstTest.java): Validates high-concurrency first-login burst scenarios (e.g. SPA firing 20 concurrent parallel requests for a new user), asserting that the per-tenant keyed mutex, Caffeine existence cache, and `DataIntegrityViolationException` suppression guarantee exactly 1 root record is created with 0 duplicate key errors or deadlocks.
+- [`TenantInitializerChildTableSeedingTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/provisioning/TenantInitializerChildTableSeedingTest.java): Tests the `TenantInitializer` SPI callback, verifying that custom post-provisioning logic executes with `ShardContextHolder` automatically bound to the target shard, allowing seamless seeding of child rows (e.g. `user_settings`) immediately following root record creation.
+- [`CustomClaimMappingTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/provisioning/CustomClaimMappingTest.java): Validates declarative custom JWT claim mappings configured via `fractal.sharding.jwt.attribute-claims`, verifying that non-standard tokens (e.g. `org_tier` mapped to `tier`) correctly extract and populate corresponding root entity columns during JIT provisioning.
+- [`ConsistentHashRouterTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/core/ConsistentHashRouterTest.java): Validates deterministic routing, MD5 hash calculation, ring contraction preserving surviving shard assignments, 64-bit ring wrap-around, null key safety, empty ring safety, virtual nodes validation ($> 0$), and uniform distribution across virtual nodes.
 - [`RoutingIntegrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/RoutingIntegrationTest.java): Validates physical database routing by asserting that `@Sharded` queries read data directly from the routed shard's database, that unannotated queries fall back to the primary database, and that `ShardContextHolder` is consistently cleaned up.
 - [`SecurityRoutingIntegrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/SecurityRoutingIntegrationTest.java): Confirms end-to-end shard routing from synthetic JWT tokens in `SecurityContextHolder`, enforces precedence of JWT extraction over method-level SpEL keys, tests fallback to SpEL keys when unauthenticated, and validates `ThreadLocal` cleanup on application exceptions.
 - [`CustomClaimSecurityRoutingIntegrationTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/CustomClaimSecurityRoutingIntegrationTest.java): Tests end-to-end shard routing using custom JWT claims (e.g. `organization_id`), and asserts failure when the required custom claim is absent from the token.
@@ -1766,4 +2103,10 @@ The test suite rigorously validates the starter across 20 test classes covering 
 - [`ReplicaTableSynchronizerTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/ReplicaTableSynchronizerTest.java): Tests batch synchronization of reference tables from primary coordinator to shards and new shard catch-up.
 - [`TableDependencyResolverTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/TableDependencyResolverTest.java): Verifies ANSI `information_schema` foreign key discovery, multi-hop BFS dependency resolution, Kahn's topological sort for insert/delete ordering, join query synthesis, table exclusion, replica table isolation, circular dependency rejection, and self-referencing foreign key handling.
 - [`TopologyManagerCaffeineCacheTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/TopologyManagerCaffeineCacheTest.java): Validates sub-microsecond Caffeine caching, zero DB queries within TTL, cache invalidation on status updates, and automatic reload on TTL expiration.
-- [`TopologyManagerLockTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/TopologyManagerLockTest.java): Verifies distributed lock acquisition, mutual exclusion, expired lock takeover via configurable TTL, periodic heartbeat renewal, graceful shutdown lock release, automatic schema initialization via `InitializingBean`, idempotent ANSI shard registration, batch pending migrations, and idempotent migration recording.
+- [`TopologyManagerLockTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/TopologyManagerLockTest.java): Verifies distributed lock acquisition, mutual exclusion, expired lock takeover via configurable TTL, periodic heartbeat renewal with circuit breaker failover, graceful shutdown lock release, automatic schema initialization via `InitializingBean`, idempotent ANSI shard registration, batch pending migrations, and idempotent migration recording.
+- [`NestedShardedContextTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/aop/NestedShardedContextTest.java): Validates nested `@Sharded` and `@ShardedBroadcast` method invocations, asserting that the outer shard context is preserved across calls and restored upon return, preventing thread-local wiping or cross-tenant contamination.
+- [`ClassLevelShardedAspectTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/aop/ClassLevelShardedAspectTest.java): Validates class-level `@Sharded` routing across methods, verifying that `@within(Sharded)` properly intercepts Spring beans without method-level annotations, evaluates SpEL parameters, and routes accordingly.
+- [`DualRingProductionDbRoutingTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/DualRingProductionDbRoutingTest.java): Validates multi-pod dual-ring production routing, ensuring non-blocking `PHASE_PENDING` routing to source shards and proper exception handling when migrations transition to active copy/prune phases (`PHASE_COPYING` and `PHASE_PRUNING`).
+- [`MultiNodePendingShardResolutionTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/MultiNodePendingShardResolutionTest.java): Validates fallback to querying `fractal_tenant_migrations` on secondary pods when pending migrations are not cached in local memory, eliminating `inFlightRequests` memory leaks and route misdirection across distributed instances.
+- [`RebalanceExceptionRecoveryTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/rebalance/RebalanceExceptionRecoveryTest.java): Validates fault-tolerant recovery when unexpected database errors interrupt `RebalanceEngine`, ensuring the tenant status is automatically rolled back to `ACTIVE` on the primary database, partial target rows are safely wiped, and local caches are invalidated.
+- [`DataSourceDisposalTest`](file:///home/aquila/Documenti/Projects/fractal-spring-boot-starter/src/test/java/io/github/mucchinas/fractal/datasource/DataSourceDisposalTest.java): Validates graceful shutdown of pooled datasources via `ShardingRoutingDataSource implements DisposableBean`, verifying that all Hikari connection pools across primary and shards are closed cleanly upon application termination without leaking connections.

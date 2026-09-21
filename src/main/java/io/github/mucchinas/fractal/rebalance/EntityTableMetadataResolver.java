@@ -21,6 +21,7 @@ import java.util.*;
 public class EntityTableMetadataResolver {
 
     private final ApplicationContext applicationContext;
+    private volatile Class<?> resolvedRootClass;
 
     public EntityTableMetadataResolver() {
         this.applicationContext = null;
@@ -28,6 +29,18 @@ public class EntityTableMetadataResolver {
 
     public EntityTableMetadataResolver(ApplicationContext applicationContext) {
         this.applicationContext = applicationContext;
+    }
+
+    public Class<?> getRootClass() {
+        if (resolvedRootClass != null) {
+            return resolvedRootClass;
+        }
+        resolve();
+        return resolvedRootClass;
+    }
+
+    public void setResolvedRootClass(Class<?> rootClass) {
+        this.resolvedRootClass = rootClass;
     }
 
     public EntityMetadataResult resolve() {
@@ -79,6 +92,8 @@ public class EntityTableMetadataResolver {
         if (rootClass == null) {
             throw new IllegalStateException("No root entity found among annotated classes. Exactly one entity must be designated as root via @ShardedRoot.");
         }
+
+        this.resolvedRootClass = rootClass;
 
         String rootTable = resolveTableName(rootClass);
         String rootIdColumn = resolveKeyColumn(rootClass, true);

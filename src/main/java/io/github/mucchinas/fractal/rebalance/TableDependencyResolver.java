@@ -1,11 +1,15 @@
 package io.github.mucchinas.fractal.rebalance;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 
 import javax.sql.DataSource;
 import java.util.*;
 
 public class TableDependencyResolver {
+
+    private static final Logger log = LoggerFactory.getLogger(TableDependencyResolver.class);
 
     private final JdbcTemplate primaryJdbcTemplate;
     private List<TableForeignKey> explicitForeignKeys;
@@ -95,7 +99,7 @@ public class TableDependencyResolver {
                 }
             });
         } catch (Exception e) {
-            System.err.println("FRACTAL: Error discovering all tables from information_schema: " + e.getMessage());
+            log.warn("FRACTAL: Error discovering all tables from information_schema: {}", e.getMessage());
         }
         return tables;
     }
@@ -220,8 +224,8 @@ public class TableDependencyResolver {
         List<String> normalizedTables = tables.stream().filter(Objects::nonNull).map(String::toLowerCase).distinct().toList();
         List<TableForeignKey> allFks = loadForeignKeys();
 
-        Map<String, List<String>> graph = new HashMap<>();
-        Map<String, Integer> inDegree = new HashMap<>();
+        Map<String, List<String>> graph = new LinkedHashMap<>();
+        Map<String, Integer> inDegree = new LinkedHashMap<>();
 
         for (String table : normalizedTables) {
             graph.put(table, new ArrayList<>());
@@ -260,8 +264,8 @@ public class TableDependencyResolver {
         }
 
         if (insertOrder.size() != normalizedTables.size()) {
-            throw new IllegalStateException("Rilevato ciclo nelle Foreign Key o tabelle mancanti. " +
-                    "Il Topological Sort è fallito. Controlla lo schema del database.");
+            throw new IllegalStateException("Detected cycle in foreign keys or missing tables (Rilevato ciclo nelle Foreign Key). " +
+                    "Topological sort failed. Please check your database schema.");
         }
 
         return insertOrder;

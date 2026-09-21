@@ -3,6 +3,8 @@ package io.github.mucchinas.fractal.rebalance;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import io.github.mucchinas.fractal.config.FractalProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -16,8 +18,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TopologyManager implements InitializingBean, DisposableBean {
+
+    private static final Logger log = LoggerFactory.getLogger(TopologyManager.class);
 
     public static final String REBALANCE_LOCK = "REBALANCE_LOCK";
     public static final String PHASE_PENDING = "PENDING";
@@ -32,6 +37,7 @@ public class TopologyManager implements InitializingBean, DisposableBean {
     private final JdbcTemplate primaryJdbcTemplate;
     private final String instanceId;
     private final boolean autoInitializeSchema;
+    private final Duration defaultLockTimeout;
     private final Set<String> activeMigratingTenants = ConcurrentHashMap.newKeySet();
     private final ConcurrentMap<String, java.util.concurrent.atomic.LongAdder> inFlightRequests = new ConcurrentHashMap<>();
     private final Cache<String, Boolean> migrationStatusCache;
@@ -47,19 +53,25 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     private ScheduledFuture<?> heartbeatTask;
     private volatile boolean lockHeld = false;
+    private final AtomicInteger heartbeatFailures = new AtomicInteger(0);
 
     public TopologyManager(DataSource primaryDataSource) {
-        this(primaryDataSource, true, Duration.ofSeconds(2), 50_000L);
+        this(primaryDataSource, true, Duration.ofSeconds(2), 50_000L, Duration.ofMinutes(15));
     }
 
     public TopologyManager(DataSource primaryDataSource, boolean autoInitializeSchema) {
-        this(primaryDataSource, autoInitializeSchema, Duration.ofSeconds(2), 50_000L);
+        this(primaryDataSource, autoInitializeSchema, Duration.ofSeconds(2), 50_000L, Duration.ofMinutes(15));
     }
 
     public TopologyManager(DataSource primaryDataSource, boolean autoInitializeSchema, Duration statusCacheTtl, long statusCacheMaxSize) {
+        this(primaryDataSource, autoInitializeSchema, statusCacheTtl, statusCacheMaxSize, Duration.ofMinutes(15));
+    }
+
+    public TopologyManager(DataSource primaryDataSource, boolean autoInitializeSchema, Duration statusCacheTtl, long statusCacheMaxSize, Duration lockTimeout) {
         this.primaryJdbcTemplate = new JdbcTemplate(primaryDataSource);
         this.instanceId = generateInstanceId();
         this.autoInitializeSchema = autoInitializeSchema;
+        this.defaultLockTimeout = lockTimeout != null ? lockTimeout : Duration.ofMinutes(15);
         Duration ttl = statusCacheTtl != null ? statusCacheTtl : Duration.ofSeconds(2);
         long maxSize = statusCacheMaxSize > 0 ? statusCacheMaxSize : 50_000L;
         this.migrationStatusCache = Caffeine.newBuilder()
@@ -104,7 +116,8 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     private boolean checkGlobalRebalanceInDb() {
         try {
-            Timestamp validThreshold = Timestamp.from(Instant.now().minus(Duration.ofMinutes(15)));
+            Duration timeout = defaultLockTimeout != null ? defaultLockTimeout : Duration.ofMinutes(15);
+            Timestamp validThreshold = Timestamp.from(Instant.now().minus(timeout));
             List<String> locks = primaryJdbcTemplate.query(
                     "SELECT locked_by FROM fractal_locks WHERE lock_name = ? AND locked_at > ?",
                     (rs, rowNum) -> rs.getString(1), REBALANCE_LOCK, validThreshold);
@@ -151,7 +164,20 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         if (tenantId == null) {
             return null;
         }
-        return pendingSourceShards.get(tenantId);
+        String local = pendingSourceShards.get(tenantId);
+        if (local != null) {
+            return local;
+        }
+        try {
+            List<String> list = primaryJdbcTemplate.query(
+                    "SELECT source_shard FROM fractal_tenant_migrations WHERE tenant_id = ? AND phase = ?",
+                    (rs, rowNum) -> rs.getString(1), tenantId, PHASE_PENDING);
+            if (!list.isEmpty()) {
+                return list.get(0);
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     public void completePendingMigration(String tenantId) {
@@ -206,10 +232,10 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     public void registerRequestEnd(String tenantId) {
         if (tenantId != null) {
-            java.util.concurrent.atomic.LongAdder adder = inFlightRequests.get(tenantId);
-            if (adder != null) {
+            inFlightRequests.computeIfPresent(tenantId, (k, adder) -> {
                 adder.decrement();
-            }
+                return adder.sum() <= 0 ? null : adder;
+            });
         }
     }
 
@@ -239,6 +265,12 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         return adder == null || adder.sum() <= 0;
     }
 
+    public boolean isTenantMigrating(String tenantId) {
+        FractalProperties.RebalancerProperties props = new FractalProperties.RebalancerProperties();
+        props.setEnabled(true);
+        return isTenantMigrating(tenantId, props);
+    }
+
     public boolean isTenantMigrating(String tenantId, FractalProperties.RebalancerProperties props) {
         if (tenantId == null || props == null || !props.isEnabled()) {
             return false;
@@ -251,18 +283,28 @@ public class TopologyManager implements InitializingBean, DisposableBean {
         return Boolean.TRUE.equals(migrationStatusCache.get(tenantId, key -> checkMigrationInPrimaryDb(key, props)));
     }
 
-    private boolean checkMigrationInPrimaryDb(String tenantId, FractalProperties.RebalancerProperties props) {
+    public boolean checkMigrationInPrimaryDb(String tenantId) {
+        return checkMigrationInPrimaryDb(tenantId, null);
+    }
+
+    public boolean checkMigrationInPrimaryDb(String tenantId, FractalProperties.RebalancerProperties props) {
+        if (tenantId == null) {
+            return false;
+        }
         try {
             List<String> phases = primaryJdbcTemplate.query(
                     "SELECT phase FROM fractal_tenant_migrations WHERE tenant_id = ?",
                     (rs, rowNum) -> rs.getString(1), tenantId);
             if (!phases.isEmpty()) {
-                return true;
+                String phase = phases.get(0);
+                if (PHASE_COPYING.equalsIgnoreCase(phase) || PHASE_PRUNING.equalsIgnoreCase(phase)) {
+                    return true;
+                }
             }
         } catch (Exception ignored) {
         }
 
-        if (props.getRootTable() != null && props.getRootIdColumn() != null && props.getStatusColumn() != null) {
+        if (props != null && props.getRootTable() != null && props.getRootIdColumn() != null && props.getStatusColumn() != null) {
             try {
                 String sql = String.format("SELECT %s FROM %s WHERE %s = ?",
                         props.getStatusColumn(), props.getRootTable(), props.getRootIdColumn());
@@ -471,9 +513,10 @@ public class TopologyManager implements InitializingBean, DisposableBean {
                     REBALANCE_LOCK, instanceId
             );
         } catch (Exception e) {
-            System.err.println("FRACTAL: Error releasing rebalance lock: " + e.getMessage());
+            log.error("FRACTAL: Error releasing rebalance lock: {}", e.getMessage(), e);
         } finally {
             lockHeld = false;
+            heartbeatFailures.set(0);
             setRebalanceActive(false);
             clearPendingMigrations();
         }
@@ -481,15 +524,31 @@ public class TopologyManager implements InitializingBean, DisposableBean {
 
     private synchronized void startHeartbeat(Duration refreshInterval) {
         stopHeartbeat();
+        heartbeatFailures.set(0);
         long intervalMs = refreshInterval != null ? refreshInterval.toMillis() : 60_000L;
         heartbeatTask = heartbeatExecutor.scheduleAtFixedRate(() -> {
             try {
-                primaryJdbcTemplate.update(
+                int updated = primaryJdbcTemplate.update(
                         "UPDATE fractal_locks SET locked_at = ? WHERE lock_name = ? AND locked_by = ?",
                         Timestamp.from(Instant.now()), REBALANCE_LOCK, instanceId
                 );
+                if (updated > 0) {
+                    heartbeatFailures.set(0);
+                } else {
+                    int fails = heartbeatFailures.incrementAndGet();
+                    log.warn("FRACTAL: Heartbeat lock update affected 0 rows (attempt {})", fails);
+                    if (fails >= 3) {
+                        lockHeld = false;
+                        log.error("FRACTAL: Rebalance lock was lost or taken over. Relinquishing local lock.");
+                    }
+                }
             } catch (Exception e) {
-                System.err.println("FRACTAL: Failed to refresh rebalance lock heartbeat: " + e.getMessage());
+                int fails = heartbeatFailures.incrementAndGet();
+                log.error("FRACTAL: Failed to refresh rebalance lock heartbeat (failure {}): {}", fails, e.getMessage());
+                if (fails >= 3) {
+                    lockHeld = false;
+                    log.error("FRACTAL: Heartbeat failed 3 consecutive times. Relinquishing local lock to prevent split-brain.");
+                }
             }
         }, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
     }
