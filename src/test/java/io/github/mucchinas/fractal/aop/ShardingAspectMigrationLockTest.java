@@ -40,8 +40,11 @@ class ShardingAspectMigrationLockTest {
     @Autowired
     private TopologyManager topologyManager;
 
-    @org.junit.jupiter.api.BeforeEach
-    void setUp() {
+    @Autowired(required = false)
+    private org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor fractalRebalanceExecutor;
+
+    @org.junit.jupiter.api.BeforeAll
+    static void initPrimary() {
         org.springframework.jdbc.datasource.DriverManagerDataSource primaryDs = new org.springframework.jdbc.datasource.DriverManagerDataSource();
         primaryDs.setDriverClassName("org.h2.Driver");
         primaryDs.setUrl("jdbc:h2:mem:miglock_primary;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1");
@@ -50,7 +53,25 @@ class ShardingAspectMigrationLockTest {
 
         org.springframework.jdbc.core.JdbcTemplate primaryJdbc = new org.springframework.jdbc.core.JdbcTemplate(primaryDs);
         primaryJdbc.execute("CREATE TABLE IF NOT EXISTS users (id VARCHAR(255) PRIMARY KEY, status VARCHAR(50))");
+        primaryJdbc.execute("CREATE TABLE IF NOT EXISTS fractal_shard_topology (shard_name VARCHAR(100) PRIMARY KEY, status VARCHAR(50) NOT NULL, registered_at TIMESTAMP NOT NULL)");
+        primaryJdbc.execute("MERGE INTO fractal_shard_topology KEY(shard_name) VALUES ('shard-1', 'ACTIVE', CURRENT_TIMESTAMP)");
+        primaryJdbc.execute("MERGE INTO fractal_shard_topology KEY(shard_name) VALUES ('shard-2', 'ACTIVE', CURRENT_TIMESTAMP)");
         primaryJdbc.execute("MERGE INTO users KEY(id) VALUES ('tenant-free', 'ACTIVE')");
+    }
+
+    @org.junit.jupiter.api.BeforeEach
+    void setUp() throws Exception {
+        if (fractalRebalanceExecutor != null) {
+            long deadline = System.currentTimeMillis() + 3000;
+            while ((fractalRebalanceExecutor.getActiveCount() > 0 || fractalRebalanceExecutor.getThreadPoolExecutor().getQueue().size() > 0)
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(50);
+            }
+        }
+        ShardContextHolder.clear();
+        topologyManager.markTenantActive("tenant-locked");
+        topologyManager.markTenantActive("tenant-restored");
+        topologyManager.getMigrationStatusCache().invalidateAll();
     }
 
     @AfterEach
@@ -58,6 +79,7 @@ class ShardingAspectMigrationLockTest {
         ShardContextHolder.clear();
         topologyManager.markTenantActive("tenant-locked");
         topologyManager.markTenantActive("tenant-restored");
+        topologyManager.getMigrationStatusCache().invalidateAll();
     }
 
     @Test
